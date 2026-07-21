@@ -1,0 +1,25 @@
+# Secrets — NEVER commit
+.env
+server/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+uv.lock
+
+# Runtime / generated
+uploads/
+outputs/
+vendor/
+.cache/
+*.log
+
+# OS
+.DS_Store

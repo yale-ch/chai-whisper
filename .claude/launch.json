@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "chai-whisper",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "chai-whisper", "serve", "-p", "5058"],
+      "port": 5058
+    }
+  ]
+}

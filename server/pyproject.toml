@@ -1,0 +1,31 @@
+[project]
+name = "chai-whisper-server"
+version = "0.1.0"
+description = "CHAI-Whisper DGX API server — runs the chai whisper workflow on the NVIDIA DGX Spark"
+requires-python = ">=3.12"
+dependencies = [
+    # The chai engine, with its optional whisper extra (faster-whisper,
+    # ctranslate2, pyannote-audio, numpy). Pulled from the beta branch.
+    "chai-engine[whisper] @ git+https://github.com/yale-ch/chai-engine.git@beta",
+    "flask>=3.0.0",
+    "python-dotenv>=1.0.1",
+    # DGX Spark (GB10, sm_121, aarch64) needs the CUDA 13 torch wheels — the
+    # same pins as yale-ch/dgx-whisper. cu130 bundles nvrtc 13 / cuDNN 9 so both
+    # whisper and pyannote run on the GPU. See setup_ct2_gpu.sh for CTranslate2.
+    "torch==2.13.0+cu130",
+    "torchaudio==2.11.0+cu130",
+]
+
+[tool.uv]
+# scripts/setup_ct2_gpu.sh compiles the CTranslate2 bindings from source, which
+# needs Python dev headers (Python.h). uv-managed interpreters include them.
+python-preference = "only-managed"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

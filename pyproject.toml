@@ -1,0 +1,27 @@
+[project]
+name = "chai-whisper"
+version = "0.1.0"
+description = "CHAI-Whisper — local front-end for DGX audio transcription + diarization via the chai workflow"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0.0",
+    "sshtunnel>=0.4.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.1",
+]
+
+# NOTE: ffmpeg is a *system* dependency (not a Python package) — the local app
+# shells out to it to extract audio. Install via `brew install ffmpeg` (macOS)
+# or `winget install ffmpeg` (Windows). The DGX API server has its own
+# pyproject under server/.
+
+[project.scripts]
+chai-whisper = "src.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]
