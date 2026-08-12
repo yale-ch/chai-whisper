@@ -15,6 +15,7 @@ venv/
 uv.lock
 
 # Runtime / generated
+data/            # SQLite workspace DB (projects, materials, versions)
 uploads/
 outputs/
 vendor/

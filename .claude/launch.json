@@ -4,8 +4,8 @@
     {
       "name": "chai-whisper",
       "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "chai-whisper", "serve", "-p", "5058"],
-      "port": 5058
+      "runtimeArgs": ["run", "uvicorn", "app.main:app", "--port", "5059"],
+      "port": 5059
     }
   ]
 }

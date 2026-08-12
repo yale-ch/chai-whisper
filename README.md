@@ -1,74 +1,77 @@
 # CHAI-Whisper
 
-Audio transcription **and speaker diarization** for the Yale DGX, with a local
-Yale-branded web app that offloads GPU inference to the DGX. Modeled on
-[`yale-scanning-qc`](../yale-scanning-qc): a local app calls a small Flask API on
-the DGX, which runs the model. Here the model work is a **[chai](../chai-engine)
-workflow** (`whisper.WhisperTranscriber` = faster-whisper + pyannote), and the
-inference core is ported from [`yale-ch/dgx-whisper`](https://github.com/yale-ch/dgx-whisper).
+A local **workspace** for transcribing audio/video on the Yale DGX and editing the
+results — organize A/V into **projects**, transcribe + diarize on the GPU, then
+review the media beside an **editable, versioned transcript** with speaker
+labels, playback-synced highlighting, and edit metrics. Modeled on
+[`../chai-docs`](../chai-docs) (FastAPI + a no-build vanilla-JS SPA), transcription
+runs as a [chai](../chai-engine) `whisper.WhisperTranscriber` workflow on the DGX.
 
-**Data minimization:** the local app strips the audio track from whatever A/V
-file you pick and re-encodes it to 16 kHz mono Opus before upload. Only that
-audio ever leaves your machine — never the video, never the original file.
+**Data minimization:** only *audio* ever leaves your machine — the app extracts a
+16 kHz mono Opus track from whatever you point it at (even video) before sending
+it to the DGX. **Media stays where it is:** the DB stores the **local path**, never
+the bytes.
 
 ```
-┌─────────────────────────────┐         SSH tunnel          ┌────────────────────────────┐
-│  Local machine (src/)        │  (bearer-token HTTP over    │  DGX Spark (server/)        │
-│                              │   127.0.0.1:<fwd> → :8060)  │                             │
-│  browser ── upload A/V ──▶   │                             │  Flask API                  │
-│  Flask app                   │                             │   POST /jobs                │
-│   • ffmpeg → 16k mono Opus ──┼──── audio only ────────────▶│   → worker → chai Workflow  │
-│   • submit job, poll         │◀─── transcript JSON ────────┼──   WhisperTranscriber      │
-│   • render transcript        │                             │      (faster-whisper +      │
-│                              │                             │       pyannote, on GPU)     │
-└─────────────────────────────┘                             └────────────────────────────┘
+Local workspace (app/ + static/)                    DGX (server/)
+  projects → materials (local paths)                  Flask API :8060
+  FastAPI + vanilla SPA :5059                          bearer + SSH-key tunnel
+   • add material by path/folder                       chai Workflow →
+   • Transcribe → extract audio ──── audio only ──────▶  WhisperTranscriber
+   • side-by-side media + transcript ◀── transcript ──   (faster-whisper +
+   • edit text/speakers, versioned                        pyannote, GB10 GPU)
+   • synced highlight + auto-scroll
 ```
 
-This repo is **both** halves:
-- **`src/`** — the local front-end (Flask, Yale palette). Run on your machine.
-- **`server/`** — the DGX API server bundle. Deploy on the DGX. See [`server/README.md`](server/README.md).
+## Run
 
-## Local app
-
-Requires **ffmpeg** on PATH (`brew install ffmpeg` / `winget install ffmpeg`).
+Requires **ffmpeg/ffprobe** on PATH (`brew install ffmpeg`), and the DGX reachable
+(SSH key + `.env`, see `.env.example`).
 
 ```bash
-cp .env.example .env         # set SPARK_* + CHAI_WHISPER_TOKEN
-uv run chai-whisper serve    # http://127.0.0.1:5058
+cp .env.example .env         # SPARK_* (host/user, key auth) + CHAI_WHISPER_TOKEN
+uv run uvicorn app.main:app --port 5059   # → http://localhost:5059
 ```
+(No build step; `static/` is plain HTML/CSS/JS. No `--reload`: restart uvicorn
+after backend edits, refresh the browser for frontend edits.)
 
-Open the page, pick an audio or video file, choose the model / language and
-whether to identify speakers, and hit **Transcribe**. Results render with
-speaker labels and timestamps and download as `.txt` / `.srt` / `.json`.
+## Using it
 
-Config (`.env`, see `.env.example`): `SPARK_IP`, `SPARK_USERNAME`,
-`SPARK_PASSWORD`, `SPARK_PORT` (SSH-tunnel to the DGX), or `CHAI_WHISPER_URL`
-(direct), plus the shared `CHAI_WHISPER_TOKEN`.
+1. **Create a project**, then **add material** by selecting audio/video file(s) or
+   a folder with the file picker (or import from a **IIIF manifest**). Selected
+   media is copied into the project store (`data/media/`); the DB keeps only a
+   path, never the bytes. **Lexicons** for the sensitive-language scan are managed
+   globally under the top-nav **Lexicons** page (create/upload/view/edit terms)
+   and are shared by every project.
+2. **Transcribe (DGX)** — pick a model, language, and whether to identify
+   speakers; the app extracts audio, sends it over the SSH tunnel to the DGX chai
+   workflow, and saves the result as **version 1**. Or **Import…** an existing
+   `.json`/`.srt` as a version.
+3. **Review & edit** in the viewer: play the media and the current segment
+   **highlights**; toggle **auto-scroll** to keep it centered; **click a segment
+   to seek** the audio/video. Edit segment text inline, reassign or rename
+   speakers (with colors) in the Speakers panel.
+4. **Save edits** → a new append-only version. Switch versions, **Restore** an
+   older one (which appends a copy — history only grows).
+5. **Your edits** panel quantifies changes: per-version and cumulative segments
+   edited/added/removed, word- and character-level changes, speaker reassignments
+   and renames.
 
-## The chai workflow
+## Layout
 
-The DGX runs this workflow (assembled in `server/worker.py`):
+- `app/main.py` — FastAPI routes + static SPA mount. `serve()` = `chai-whisper` script.
+- `app/db.py` — the only SQLite layer (projects, materials, append-only `transcription_versions`). Media = path only.
+- `app/media.py` — ffprobe metadata + HTTP **Range** streaming (so `<video>` can seek).
+- `app/ingest.py` — register a path/folder as materials; build snapshots from DGX results / `.json` / `.srt`.
+- `app/jobs.py` — background transcription worker (extract audio → DGX → save v1).
+- `app/diffing.py` — change quantification between version snapshots.
+- `static/` — `index.html`, `app.js` (hash-routed SPA + synced viewer/editor), `style.css` (Yale palette).
+- `src/` — reused DGX client (`remote.py`, SSH-key tunnel + bearer), audio extraction (`audio.py`), config (`config.py`).
+- `server/` — the DGX API bundle (deploy separately; see [`server/README.md`](server/README.md)).
 
-```
-provider.FileListProvider  →  iterator.Iterator  →  whisper.WhisperTranscriber
-```
+## Notes
 
-`whisper.WhisperTranscriber` was added to `chai-engine` (`chai/whisper.py`, beta
-branch). It decodes to 16 kHz WAV, transcribes with faster-whisper (word
-timestamps + VAD), and — when `diarize` is on — labels speakers with pyannote.
-Its output `ItemResult` carries the transcript text plus structured
-`segments`, `srt`, and `txt` in `metadata`. Install the extra with
-`pip install "chai-engine[whisper]"`.
-
-## DGX server
-
-Deploy `server/` on the DGX as a systemd user service (uv + `setup_ct2_gpu.sh`
-for GPU CTranslate2 on aarch64/CUDA 13). Full instructions and the API contract
-are in [`server/README.md`](server/README.md).
-
-## Security notes
-
-- `.env` (local) and `server/.env` (DGX) hold live secrets and are gitignored —
-  never commit them. Use a long random `CHAI_WHISPER_TOKEN`.
-- The DGX API port stays on loopback; reach it only over the SSH tunnel.
-- Diarization uses the gated pyannote model, so the DGX needs an `HF_TOKEN`.
+- Media is served straight from its local path; move/delete the original and the
+  material shows “media file not found” (by design — nothing is copied).
+- `.env` / `server/.env` hold secrets and are gitignored; the DGX uses SSH key auth.
+- Only audio is sent to the DGX, even for video — data-minimization preserved.

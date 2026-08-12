@@ -1,27 +1,32 @@
 [project]
 name = "chai-whisper"
 version = "0.1.0"
-description = "CHAI-Whisper — local front-end for DGX audio transcription + diarization via the chai workflow"
+description = "CHAI-Whisper — project workspace for DGX audio/video transcription, diarization, and versioned transcript editing"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "flask>=3.0.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
     "sshtunnel>=0.4.0",
     "requests>=2.31.0",
     "python-dotenv>=1.0.1",
 ]
 
-# NOTE: ffmpeg is a *system* dependency (not a Python package) — the local app
-# shells out to it to extract audio. Install via `brew install ffmpeg` (macOS)
-# or `winget install ffmpeg` (Windows). The DGX API server has its own
-# pyproject under server/.
+# NOTE: ffmpeg/ffprobe are *system* dependencies (not Python packages) — the app
+# shells out to them to extract audio and probe media. Install via
+# `brew install ffmpeg` (macOS) or `winget install ffmpeg` (Windows). The DGX API
+# server has its own pyproject under server/.
 
 [project.scripts]
-chai-whisper = "src.cli:main"
+chai-whisper = "app.main:serve"
+
+[project.optional-dependencies]
+dev = ["pytest"]
 
 [build-system]
 requires = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["src"]
+packages = ["app", "src"]
