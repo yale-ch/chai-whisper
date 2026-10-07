@@ -21,14 +21,16 @@ _CHUNK = 1024 * 1024  # 1 MiB
 
 
 def probe(path: str) -> dict:
-    """Return {media_type, duration, width, height} via ffprobe (best-effort)."""
-    info = {"media_type": "audio", "duration": None, "width": None, "height": None}
+    """Return {media_type, duration, width, height, has_audio, audio_codec,
+    video_codec} via ffprobe (best-effort; has_audio is None if unknown)."""
+    info = {"media_type": "audio", "duration": None, "width": None, "height": None,
+            "has_audio": None, "audio_codec": None, "video_codec": None}
     if shutil.which("ffprobe") is None:
         return info
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
-             "format=duration:stream=codec_type,width,height",
+             "format=duration:stream=codec_type,codec_name,width,height:stream_disposition=attached_pic",
              "-of", "json", str(path)],
             capture_output=True, text=True, check=True).stdout
         data = json.loads(out)
@@ -40,13 +42,47 @@ def probe(path: str) -> dict:
             info["duration"] = float(dur)
         except ValueError:
             pass
+    info["has_audio"] = False
     for s in data.get("streams", []):
-        if s.get("codec_type") == "video":
-            info["media_type"] = "video"
-            info["width"] = s.get("width")
-            info["height"] = s.get("height")
-            break
+        if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic"):
+            if info["video_codec"] is None:
+                info["media_type"] = "video"
+                info["width"] = s.get("width")
+                info["height"] = s.get("height")
+                info["video_codec"] = s.get("codec_name")
+        elif s.get("codec_type") == "audio" and not info["has_audio"]:
+            info["has_audio"] = True
+            info["audio_codec"] = s.get("codec_name")
     return info
+
+
+# Audio codecs Chromium/Safari/Firefox decode inside mp4/mov/webm. Others (PCM in
+# a .mov, AC-3, ALAC, WMA…) give *silent* playback even though ffmpeg — and so
+# transcription — handles them fine.
+BROWSER_AUDIO = {"aac", "mp3", "opus", "vorbis", "flac"}
+
+
+def ensure_browser_audio(path: str, info: dict | None = None) -> tuple[str, dict]:
+    """If an owned media file's audio can't be played in the browser, re-encode
+    just the audio to AAC (video stream copied) into an .mp4/.m4a beside it and
+    delete the original. Returns (path, probe-info) of the file to use."""
+    info = info or probe(path)
+    codec = info.get("audio_codec")
+    if not info.get("has_audio") or codec in BROWSER_AUDIO or shutil.which("ffmpeg") is None:
+        return path, info
+    if (codec or "").startswith("pcm_") and Path(path).suffix.lower() == ".wav":
+        return path, info  # PCM WAV plays natively
+    src = Path(path)
+    dest = src.with_name(src.stem + "-play" + (".mp4" if info["media_type"] == "video" else ".m4a"))
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-map", "0:v:0?", "-map", "0:a:0",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dest)]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+    except Exception:
+        dest.unlink(missing_ok=True)
+        return path, info
+    src.unlink(missing_ok=True)
+    return str(dest), probe(str(dest))
 
 
 def guess_type(path: str) -> str:

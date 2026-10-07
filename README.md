@@ -38,32 +38,48 @@ after backend edits, refresh the browser for frontend edits.)
 ## Using it
 
 1. **Create a project**, then **add material** by selecting audio/video file(s) or
-   a folder with the file picker (or import from a **IIIF manifest**). Selected
-   media is copied into the project store (`data/media/`); the DB keeps only a
-   path, never the bytes. **Lexicons** for the sensitive-language scan are managed
-   globally under the top-nav **Lexicons** page (create/upload/view/edit terms)
-   and are shared by every project.
-2. **Transcribe (DGX)** — pick a model, language, and whether to identify
-   speakers; the app extracts audio, sends it over the SSH tunnel to the DGX chai
-   workflow, and saves the result as **version 1**. Or **Import…** an existing
-   `.json`/`.srt` as a version.
-3. **Review & edit** in the viewer: play the media and the current segment
-   **highlights**; toggle **auto-scroll** to keep it centered; **click a segment
-   to seek** the audio/video. Edit segment text inline, reassign or rename
-   speakers (with colors) in the Speakers panel.
-4. **Save edits** → a new append-only version. Switch versions, **Restore** an
+   a folder with the file picker (or import from a **IIIF manifest** — `Choice`
+   renditions, HLS/DASH streams, and video with a separately-published audio
+   track are all handled; audio the browser can't play, e.g. AC-3, is re-encoded
+   to AAC). Selected media is copied into the project store (`data/media/`); the
+   DB keeps only a path, never the bytes. **Lexicons** for the sensitive-language
+   scan are managed globally under the top-nav **Lexicons** page.
+2. **Transcribe (DGX)** — from a recording, or **select several on the project page
+   and “Transcribe selected”**. Jobs run on the server and show in the
+   **Background jobs** tray (bottom right, minimizable) on every page, so you can
+   keep working; queued jobs can be cancelled. Language accepts ISO 639-1/-2 codes
+   (`en`, `eng`, `ger`/`deu`, `en-US`) or a name. Or **Import…** an existing
+   `.vtt`, `.srt`, `.txt` or `.json` (any encoding — UTF-8/16, Windows-1252).
+   Plain text is checked for timestamps (`[00:01:23]`, `Speaker 1  0:03`,
+   `Jane (1:23): …`); without them, timings are estimated across the media length.
+3. **Review & edit** in the viewer: click a line’s **▶ timestamp** to play from
+   there; **✎ time** edits start/end (or set them from the playhead). Edit text
+   inline, reassign or rename speakers, and leave **📝 notes** on lines (shown
+   inline; resolve/delete). Leaving with unsaved edits asks first.
+4. **Editors** are per recording (assign several, in bulk from the project page).
+   “You are” (per browser) signs your notes and saved versions.
+5. **Save edits** → a new append-only version. Switch versions, **Restore** an
    older one (which appends a copy — history only grows).
-5. **Your edits** panel quantifies changes: per-version and cumulative segments
-   edited/added/removed, word- and character-level changes, speaker reassignments
-   and renames.
+6. **Sensitive-language scan**: scanning the `vtt`/`srt` rendering reports each hit
+   with its cue number, start/end time, speaker and full cue text (click to play);
+   download as **CSV**. Run folders get `report.txt/json/csv`.
+7. **Export** writes the chosen formats (vtt, txt, srt, json, csv) plus **TPME**
+   provenance sidecars ([AI4LAM TPME 1.0](https://doi.org/10.5281/zenodo.21287085)):
+   `<file>.tpme.json` per transcript file (with its sha256) and
+   `<name>.tpme-history.json` (the version chain). Field choices live in
+   `app/tpme.py`; set the TPME `provider` in project defaults.
+8. **Your edits** panel quantifies changes per version and cumulatively.
 
 ## Layout
 
 - `app/main.py` — FastAPI routes + static SPA mount. `serve()` = `chai-whisper` script.
 - `app/db.py` — the only SQLite layer (projects, materials, append-only `transcription_versions`). Media = path only.
 - `app/media.py` — ffprobe metadata + HTTP **Range** streaming (so `<video>` can seek).
-- `app/ingest.py` — register a path/folder as materials; build snapshots from DGX results / `.json` / `.srt`.
-- `app/jobs.py` — background transcription worker (extract audio → DGX → save v1).
+- `app/ingest.py` — register uploads/IIIF as materials; parse DGX results and `.json` / `.vtt` / `.srt` / `.txt` imports.
+- `app/textio.py` — encoding-tolerant decoding for every text upload.
+- `app/jobs.py` — background job queue (transcribe, IIIF import), listed in the UI tray; queued jobs cancellable.
+- `app/scan.py` / `app/exporters.py` / `app/exports.py` — sensitive-language scan (+ CSV), format renderers, run folders.
+- `app/tpme.py` — TPME provenance records per version; `app/languages.py` — ISO 639 code mapping for Whisper.
 - `app/diffing.py` — change quantification between version snapshots.
 - `static/` — `index.html`, `app.js` (hash-routed SPA + synced viewer/editor), `style.css` (Yale palette).
 - `src/` — reused DGX client (`remote.py`, SSH-key tunnel + bearer), audio extraction (`audio.py`), config (`config.py`).
@@ -71,7 +87,9 @@ after backend edits, refresh the browser for frontend edits.)
 
 ## Notes
 
-- Media is served straight from its local path; move/delete the original and the
-  material shows “media file not found” (by design — nothing is copied).
+- Media is served straight from its stored path; move/delete it and the
+  material shows “media file not found”.
+- The job list lives in server memory: restarting uvicorn forgets queued jobs
+  (finished transcripts are already saved as versions).
 - `.env` / `server/.env` hold secrets and are gitignored; the DGX uses SSH key auth.
 - Only audio is sent to the DGX, even for video — data-minimization preserved.

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from fastapi.responses import Response as _Resp
 from src import remote
-from . import db, diffing, exports, ingest, jobs, media, scan
+from . import db, diffing, exports, ingest, jobs, languages, media, scan, tpme
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -47,11 +47,21 @@ class TranscribeIn(BaseModel):
     num_speakers: int | None = None
     min_speakers: int | None = None
     max_speakers: int | None = None
+    requested_by: str | None = None
+
+
+class BatchTranscribeIn(TranscribeIn):
+    material_ids: list[str]
 
 
 class SaveTranscriptionIn(BaseModel):
     data: dict
     note: str = ""
+    editor: str | None = None
+
+
+class EditorsIn(BaseModel):
+    editors: list[str]
 
 
 class SettingsIn(BaseModel):
@@ -65,6 +75,8 @@ class ProjectSettingsIn(BaseModel):
     default_lexicon_ids: list[str] | None = None
     scan_format: str | None = None
     editor_name: str | None = None
+    tpme_enabled: bool | None = None
+    provider: str | None = None
 
 
 class IIIFIn(BaseModel):
@@ -87,6 +99,7 @@ class ExportIn(BaseModel):
     version: int | None = None
     formats: list[str] = ["vtt", "txt"]
     scan: ScanCfg | None = None
+    tpme: bool | None = None
 
 
 # ---------------------------------------------------------------- settings/status
@@ -99,6 +112,11 @@ def get_settings():
 def post_settings(body: SettingsIn):
     db.save_settings({k: v for k, v in body.model_dump().items() if v is not None})
     return db.get_settings()
+
+
+@app.get("/api/languages")
+def api_languages():
+    return languages.all_languages()
 
 
 @app.get("/api/remote/status")
@@ -232,6 +250,16 @@ def api_get_material(mid: str):
     m = db.get_material(mid)
     if not m:
         raise HTTPException(404, "material not found")
+    if m.get("has_audio") is None and m.get("media_exists"):
+        # One-time upgrade for rows added before audio was probed: record
+        # has_audio, and fix browser-silent audio (e.g. AC-3) in files we own.
+        info = media.probe(m["media_path"])
+        path = m["media_path"]
+        if db.is_owned_media(path):
+            path, info = media.ensure_browser_audio(path, info)
+        if info.get("has_audio") is not None:
+            db.update_material_media(mid, path, info)
+            m = db.get_material(mid)
     return m
 
 
@@ -239,6 +267,13 @@ def api_get_material(mid: str):
 def api_delete_material(mid: str):
     db.delete_material(mid)
     return {"deleted": True}
+
+
+@app.put("/api/materials/{mid}/editors")
+def api_set_editors(mid: str, body: EditorsIn):
+    if not db.get_material(mid):
+        raise HTTPException(404, "material not found")
+    return {"editors": db.set_material_editors(mid, body.editors)}
 
 
 @app.get("/api/materials/{mid}/media")
@@ -261,23 +296,56 @@ def api_poster(mid: str):
 
 
 # ---------------------------------------------------------------- transcribe / import
-@app.post("/api/materials/{mid}/transcribe")
-def api_transcribe(mid: str, body: TranscribeIn):
-    m = db.get_material(mid)
-    if not m:
-        raise HTTPException(404, "material not found")
+def _transcribe_params(body: TranscribeIn) -> dict:
     settings = db.get_settings()
+    try:
+        language = languages.normalize(body.language)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     params = {
         "model": body.model or settings.get("model", "large-v3"),
-        "language": (body.language or None),
+        "language": language,
         "diarize": body.diarize,
     }
     for k in ("num_speakers", "min_speakers", "max_speakers"):
         v = getattr(body, k)
         if v is not None:
             params[k] = v
-    job_id = jobs.submit(mid, params)
+    return params
+
+
+@app.post("/api/materials/{mid}/transcribe")
+def api_transcribe(mid: str, body: TranscribeIn):
+    m = db.get_material(mid)
+    if not m:
+        raise HTTPException(404, "material not found")
+    job_id = jobs.submit(mid, _transcribe_params(body), requested_by=body.requested_by)
     return {"job_id": job_id}
+
+
+@app.post("/api/projects/{pid}/transcribe")
+def api_transcribe_batch(pid: str, body: BatchTranscribeIn):
+    """Queue one DGX job per selected material (they run one after another)."""
+    if not db.get_project(pid):
+        raise HTTPException(404, "project not found")
+    params = _transcribe_params(body)
+    queued, skipped = [], []
+    for mid in body.material_ids:
+        m = db.get_material(mid)
+        if not m or m["project_id"] != pid:
+            skipped.append({"id": mid, "reason": "not in this project"})
+        elif not m.get("media_exists"):
+            skipped.append({"id": mid, "name": m["name"], "reason": "media file missing"})
+        elif m.get("has_audio") is False:
+            skipped.append({"id": mid, "name": m["name"], "reason": "no audio track"})
+        else:
+            queued.append({"id": mid, "job_id": jobs.submit(mid, params, requested_by=body.requested_by)})
+    return {"queued": queued, "skipped": skipped}
+
+
+@app.get("/api/jobs")
+def api_jobs():
+    return jobs.list_jobs()
 
 
 @app.get("/api/jobs/{job_id}")
@@ -285,8 +353,19 @@ def api_job(job_id: str):
     j = jobs.get(job_id)
     if not j:
         raise HTTPException(404, "unknown job")
-    return {k: j.get(k) for k in ("status", "stage", "error", "audio_kb", "version",
-                                  "progress", "count", "run_folder", "export_error", "kind")}
+    return jobs.public(j)
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def api_job_cancel(job_id: str):
+    if not jobs.cancel(job_id):
+        raise HTTPException(409, "only queued jobs can be cancelled")
+    return {"cancelled": True}
+
+
+@app.delete("/api/jobs/{job_id}")
+def api_job_dismiss(job_id: str):
+    return {"dismissed": jobs.dismiss(job_id)}
 
 
 @app.post("/api/materials/{mid}/import")
@@ -295,16 +374,14 @@ async def api_import(mid: str, file: UploadFile = File(...)):
     if not m:
         raise HTTPException(404, "material not found")
     raw = await file.read()
-    name = (file.filename or "").lower()
     try:
-        if name.endswith(".srt"):
-            data = ingest.parse_srt(raw)
-        else:
-            data = ingest.parse_json_import(raw)
+        data, fmt, timed = ingest.parse_transcript(raw, file.filename or "", duration=m.get("duration"))
     except (ValueError, json.JSONDecodeError) as e:
         raise HTTPException(400, f"could not parse transcript: {e}")
-    ver = db.save_version(mid, data, source="import", note=f"imported {file.filename}")
-    return ver
+    note = f"imported {file.filename}" + ("" if timed else " (no timestamps found; timings estimated)")
+    ver = db.save_version(mid, data, source="import", note=note,
+                          meta={"import_format": fmt, "import_filename": file.filename, "timed": timed})
+    return {**ver, "format": fmt, "timed": timed, "segments": len(data.get("segments", []))}
 
 
 # ---------------------------------------------------------------- versions
@@ -325,16 +402,28 @@ def api_version(mid: str, version: int):
 def api_save_transcription(mid: str, body: SaveTranscriptionIn):
     if not db.get_material(mid):
         raise HTTPException(404, "material not found")
-    return db.save_version(mid, body.data, source="edit", note=body.note)
+    return db.save_version(mid, body.data, source="edit", note=body.note, editor=body.editor)
 
 
 @app.post("/api/materials/{mid}/versions/{version}/restore")
-def api_restore(mid: str, version: int):
+def api_restore(mid: str, version: int, editor: str | None = None):
     v = db.get_version(mid, version)
     if not v:
         raise HTTPException(404, "version not found")
-    return db.save_version(mid, v["data"], source="restore",
-                           note=f"Restored from v{version}")
+    return db.save_version(mid, v["data"], source="restore", editor=editor,
+                           note=f"Restored from v{version}", meta={"restored_from": version})
+
+
+@app.get("/api/materials/{mid}/versions/{version}/tpme")
+def api_tpme(mid: str, version: int, history: bool = False):
+    m = db.get_material(mid)
+    v = db.get_version(mid, version)
+    if not m or not v:
+        raise HTTPException(404, "version not found")
+    settings = db.get_project_settings(m["project_id"])
+    if history:
+        return tpme.history(m, settings, upto=version)
+    return tpme.build_record(m, v, settings)
 
 
 # ---------------------------------------------------------------- scan / export / runs
@@ -348,6 +437,20 @@ def api_scan(mid: str, version: int | None = None, lexicon_ids: str = "", fmt: s
     return scan.scan_data(v["data"], terms, fmt)
 
 
+@app.get("/api/materials/{mid}/scan.csv")
+def api_scan_csv(mid: str, version: int | None = None, lexicon_ids: str = "", fmt: str = "txt"):
+    m = db.get_material(mid)
+    v = db.get_version(mid, version)
+    if not m or not v:
+        raise HTTPException(404, "no transcript to scan")
+    terms = db.get_lexicon_terms([x for x in lexicon_ids.split(",") if x])
+    result = scan.scan_data(v["data"], terms, fmt)
+    stem = exports._safe(Path(m["name"]).stem).encode("ascii", "ignore").decode() or "transcript"
+    fname = f"{stem}_v{v['version']}_scan_{result['format']}.csv"
+    return _Resp(content=scan.report_csv(result).encode("utf-8"), media_type="text/csv; charset=utf-8",
+                 headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
 @app.post("/api/materials/{mid}/export")
 def api_export(mid: str, body: ExportIn):
     m = db.get_material(mid)
@@ -357,7 +460,7 @@ def api_export(mid: str, body: ExportIn):
     if not v:
         raise HTTPException(404, "no version to export")
     scan_cfg = body.scan.model_dump() if body.scan else None
-    run = exports.write_run(m, v["version"], v["data"], body.formats, scan_cfg)
+    run = exports.write_run(m, v["version"], v["data"], body.formats, scan_cfg, tpme_enabled=body.tpme)
     return run
 
 

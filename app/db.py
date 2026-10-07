@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS materials (
     width INTEGER,
     height INTEGER,
     position INTEGER DEFAULT 0,
+    editors_json TEXT,                 -- JSON list of editor names assigned to this recording
+    has_audio INTEGER,                 -- 1/0 from ffprobe; NULL = unknown (older rows)
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS lexicons (
@@ -68,6 +70,8 @@ CREATE TABLE IF NOT EXISTS transcription_versions (
     source TEXT DEFAULT 'edit',        -- run | edit | import | restore
     note TEXT DEFAULT '',
     model TEXT,
+    editor TEXT,                       -- who saved this version (human edits)
+    meta_json TEXT,                    -- provenance for TPME: params, app versions, parent, import info
     created_at TEXT DEFAULT (datetime('now')),
     UNIQUE(material_id, version)
 );
@@ -87,7 +91,9 @@ DEFAULT_PROJECT_SETTINGS = {
     "scan_enabled": True,
     "default_lexicon_ids": [],
     "scan_format": "txt",
-    "editor_name": "",
+    "editor_name": "",          # legacy (editors are now per recording); kept for old rows
+    "tpme_enabled": True,       # write TPME provenance sidecars with each export
+    "provider": "",             # TPME `provider` (e.g. "Yale University Library")
 }
 
 
@@ -128,6 +134,10 @@ def init_db():
             "ALTER TABLE projects ADD COLUMN settings_json TEXT",
             "ALTER TABLE materials ADD COLUMN source TEXT DEFAULT 'file'",
             "ALTER TABLE materials ADD COLUMN source_url TEXT",
+            "ALTER TABLE materials ADD COLUMN editors_json TEXT",
+            "ALTER TABLE materials ADD COLUMN has_audio INTEGER",
+            "ALTER TABLE transcription_versions ADD COLUMN editor TEXT",
+            "ALTER TABLE transcription_versions ADD COLUMN meta_json TEXT",
         ):
             try:
                 conn.execute(ddl)
@@ -244,7 +254,7 @@ def get_project(pid: str):
                     (SELECT COUNT(*) FROM transcription_versions v WHERE v.material_id = m.id) AS version_count
                 FROM materials m WHERE m.project_id = ?
                 ORDER BY m.position, m.name""", (pid,))
-            project["materials"] = [_summarize_material(conn, m) for m in mats]
+            project["materials"] = [_summarize_material(conn, _material_out(m)) for m in mats]
         return project
     finally:
         conn.close()
@@ -260,19 +270,29 @@ def delete_project(pid: str):
 
 
 # ---------------------------------------------------------------- materials
+def _material_out(m: dict) -> dict:
+    m["editors"] = json.loads(m.pop("editors_json", None) or "[]")
+    if m.get("has_audio") is not None:
+        m["has_audio"] = bool(m["has_audio"])
+    return m
+
+
 def create_material(project_id: str, name: str, media_path: str, media_type: str,
-                    duration=None, width=None, height=None, source="file", source_url=None) -> dict:
+                    duration=None, width=None, height=None, source="file", source_url=None,
+                    has_audio=None) -> dict:
     mid = new_id()
     conn = connect()
     try:
         pos = conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM materials WHERE project_id = ?",
                            (project_id,)).fetchone()[0]
         conn.execute("""INSERT INTO materials
-            (id, project_id, name, media_path, media_type, source, source_url, duration, width, height, position)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (mid, project_id, name, media_path, media_type, source, source_url, duration, width, height, pos))
+            (id, project_id, name, media_path, media_type, source, source_url, duration, width, height,
+             position, has_audio)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (mid, project_id, name, media_path, media_type, source, source_url, duration, width, height,
+             pos, None if has_audio is None else int(bool(has_audio))))
         conn.commit()
-        return _row(conn, "SELECT * FROM materials WHERE id = ?", (mid,))
+        return _material_out(_row(conn, "SELECT * FROM materials WHERE id = ?", (mid,)))
     finally:
         conn.close()
 
@@ -282,12 +302,50 @@ def get_material(mid: str):
     try:
         material = _row(conn, "SELECT * FROM materials WHERE id = ?", (mid,))
         if material:
+            _material_out(material)
             material["media_exists"] = bool(material["media_path"]) and os.path.exists(material["media_path"])
             material["versions"] = _rows(conn, """
-                SELECT id, version, source, note, model, created_at
+                SELECT id, version, source, note, model, editor, created_at
                 FROM transcription_versions WHERE material_id = ?
                 ORDER BY version DESC""", (mid,))
         return material
+    finally:
+        conn.close()
+
+
+def set_material_editors(mid: str, editors: list[str]) -> list[str]:
+    """Replace a recording's editor list (trimmed, de-duplicated, order kept)."""
+    seen, out = set(), []
+    for e in editors:
+        e = (e or "").strip()
+        if e and e.lower() not in seen:
+            seen.add(e.lower())
+            out.append(e)
+    conn = connect()
+    try:
+        conn.execute("UPDATE materials SET editors_json = ? WHERE id = ?", (json.dumps(out), mid))
+        conn.commit()
+    finally:
+        conn.close()
+    return out
+
+
+def is_owned_media(media_path: str) -> bool:
+    """True for files we copied into our data dir (uploads / IIIF cache)."""
+    try:
+        return bool(media_path) and str(Path(media_path).resolve()).startswith(str(DATA_DIR.resolve()))
+    except OSError:
+        return False
+
+
+def update_material_media(mid: str, media_path: str, info: dict):
+    conn = connect()
+    try:
+        conn.execute("""UPDATE materials SET media_path = ?, media_type = ?, duration = ?, width = ?,
+            height = ?, has_audio = ? WHERE id = ?""",
+            (media_path, info["media_type"], info["duration"], info["width"], info["height"],
+             None if info.get("has_audio") is None else int(bool(info["has_audio"])), mid))
+        conn.commit()
     finally:
         conn.close()
 
@@ -319,21 +377,25 @@ def delete_material(mid: str):
 
 # ---------------------------------------------------------------- versions
 def save_version(material_id: str, data: dict, source: str = "edit",
-                 note: str = "", model: str = None) -> dict:
+                 note: str = "", model: str = None, editor: str = None,
+                 meta: dict = None) -> dict:
     """Append a new numbered version snapshot. The ONLY writer of versions —
-    history only ever grows; nothing is updated in place."""
+    history only ever grows; nothing is updated in place. ``meta`` records
+    provenance (parent version, params, app versions) for TPME sidecars."""
     conn = connect()
     try:
         nxt = conn.execute(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM transcription_versions WHERE material_id = ?",
             (material_id,)).fetchone()[0]
+        meta = {"parent_version": (nxt - 1) or None, **(meta or {})}
         vid = new_id()
         conn.execute("""INSERT INTO transcription_versions
-            (id, material_id, version, data_json, source, note, model)
-            VALUES (?,?,?,?,?,?,?)""",
-            (vid, material_id, nxt, json.dumps(data), source, note, model))
+            (id, material_id, version, data_json, source, note, model, editor, meta_json)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (vid, material_id, nxt, json.dumps(data), source, note, model, editor or None,
+             json.dumps(meta)))
         conn.commit()
-        return _row(conn, "SELECT id, version, source, note, model, created_at "
+        return _row(conn, "SELECT id, version, source, note, model, editor, created_at "
                           "FROM transcription_versions WHERE id = ?", (vid,))
     finally:
         conn.close()
@@ -350,6 +412,7 @@ def get_version(material_id: str, version: int = None):
                 WHERE material_id = ? AND version = ?""", (material_id, version))
         if row:
             row["data"] = json.loads(row.pop("data_json"))
+            row["meta"] = json.loads(row.pop("meta_json", None) or "{}")
         return row
     finally:
         conn.close()
@@ -358,7 +421,7 @@ def get_version(material_id: str, version: int = None):
 def list_versions(material_id: str) -> list:
     conn = connect()
     try:
-        return _rows(conn, """SELECT id, version, source, note, model, created_at
+        return _rows(conn, """SELECT id, version, source, note, model, editor, created_at
             FROM transcription_versions WHERE material_id = ?
             ORDER BY version DESC""", (material_id,))
     finally:

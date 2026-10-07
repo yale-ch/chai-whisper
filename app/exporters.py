@@ -1,4 +1,4 @@
-"""Render a transcript snapshot (data_json) to output formats: VTT, TXT, SRT, JSON.
+"""Render a transcript snapshot (data_json) to output formats: VTT, TXT, SRT, JSON, CSV.
 
 The canonical inputs are the ``segments`` (with stable ids, start/end, speaker,
 text) and the ``speakers`` label map produced by ``app.ingest._normalize``.
@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import json
 
-FORMATS = ["vtt", "txt", "srt", "json"]
-EXT = {"vtt": ".vtt", "txt": ".txt", "srt": ".srt", "json": ".json"}
+FORMATS = ["vtt", "txt", "srt", "json", "csv"]
+EXT = {"vtt": ".vtt", "txt": ".txt", "srt": ".srt", "json": ".json", "csv": ".csv"}
 
 
 def _label(data: dict, key) -> str:
@@ -71,7 +71,22 @@ def to_json(data: dict) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-RENDERERS = {"vtt": to_vtt, "txt": to_txt, "srt": to_srt, "json": to_json}
+def to_csv(data: dict) -> str:
+    """One row per segment (spreadsheet-friendly; UTF-8 BOM for Excel)."""
+    import csv
+    import io
+
+    buf = io.StringIO()
+    buf.write("\ufeff")
+    w = csv.writer(buf)
+    w.writerow(["index", "start", "end", "speaker", "text"])
+    for i, s in enumerate(data.get("segments", []), 1):
+        w.writerow([i, _vtt_ts(s.get("start")), _vtt_ts(s.get("end")),
+                    _label(data, s.get("speaker")), (s.get("text") or "").strip()])
+    return buf.getvalue()
+
+
+RENDERERS = {"vtt": to_vtt, "txt": to_txt, "srt": to_srt, "json": to_json, "csv": to_csv}
 
 
 def render(fmt: str, data: dict) -> str:
