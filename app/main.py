@@ -25,6 +25,31 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 app = FastAPI(title="CHAI-Whisper")
 
 
+def _git_build() -> str:
+    """Short commit + date of the running code, shown in the UI so testers can
+    tell at a glance whether they're on the latest version."""
+    import subprocess
+    try:
+        return subprocess.run(["git", "log", "-1", "--format=%h · %cs"], cwd=STATIC_DIR.parent,
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+_BUILD = _git_build()
+
+
+@app.middleware("http")
+async def _no_stale_ui(request: Request, call_next):
+    """Make browsers revalidate the SPA (index.html/app.js/style.css) on every
+    load. Without this, a browser may keep running a cached copy of an older
+    UI after the app is updated."""
+    resp = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
 @app.on_event("startup")
 def _startup():
     db.init_db()
@@ -64,6 +89,16 @@ class EditorsIn(BaseModel):
     editors: list[str]
 
 
+class MaterialTpmeIn(BaseModel):
+    """User-entered, per-recording TPME fields (blank clears → project default)."""
+    media_title: str | None = None
+    provider: str | None = None
+    conventions: str | None = None
+    originating_media_file: str | None = None
+    media_language: list[str] | None = None
+    human_review_level: str | None = None
+
+
 class SettingsIn(BaseModel):
     model: str | None = None
     diarize: str | None = None
@@ -77,6 +112,8 @@ class ProjectSettingsIn(BaseModel):
     editor_name: str | None = None
     tpme_enabled: bool | None = None
     provider: str | None = None
+    conventions: str | None = None
+    tpme_history: str | None = None
 
 
 class IIIFIn(BaseModel):
@@ -114,9 +151,19 @@ def post_settings(body: SettingsIn):
     return db.get_settings()
 
 
+@app.get("/api/version")
+def api_version_info():
+    return {"version": tpme.app_version(), "build": _BUILD}
+
+
 @app.get("/api/languages")
 def api_languages():
     return languages.all_languages()
+
+
+@app.get("/api/models")
+def api_models():
+    return languages.MODELS
 
 
 @app.get("/api/remote/status")
@@ -250,17 +297,51 @@ def api_get_material(mid: str):
     m = db.get_material(mid)
     if not m:
         raise HTTPException(404, "material not found")
-    if m.get("has_audio") is None and m.get("media_exists"):
-        # One-time upgrade for rows added before audio was probed: record
-        # has_audio, and fix browser-silent audio (e.g. AC-3) in files we own.
+    if m.get("media_exists") and (m.get("has_audio") is None or (m.get("audio_rev") or 0) < media.AUDIO_REV):
+        # One-time (per media.AUDIO_REV) check that the browser can play this
+        # file's sound. Files we own are fixed in the background; for files
+        # referenced in place the viewer offers a "fix playback audio" button.
         info = media.probe(m["media_path"])
-        path = m["media_path"]
-        if db.is_owned_media(path):
-            path, info = media.ensure_browser_audio(path, info)
         if info.get("has_audio") is not None:
-            db.update_material_media(mid, path, info)
+            db.update_material_media(mid, m["media_path"], info, audio_rev=media.AUDIO_REV)
+            if db.is_owned_media(m["media_path"]) and media.playback_issue(m["media_path"], info):
+                jobs.submit_media_fix(mid)
             m = db.get_material(mid)
+    if m.get("media_exists"):
+        m["playback_issue"] = media.playback_issue(m["media_path"], media.probe(m["media_path"]))
+    m["media_fix_running"] = any(j["kind"] == "media" and j["material_id"] == mid and j["status"] in ("queued", "running")
+                                 for j in jobs.list_jobs())
     return m
+
+
+@app.post("/api/materials/{mid}/fix-audio")
+def api_fix_audio(mid: str):
+    m = db.get_material(mid)
+    if not m:
+        raise HTTPException(404, "material not found")
+    if not m.get("media_exists"):
+        raise HTTPException(400, "media file not found on disk")
+    if m.get("has_audio") is False:
+        raise HTTPException(400, "this file has no audio track")
+    return {"job_id": jobs.submit_media_fix(mid)}
+
+
+@app.put("/api/materials/{mid}/tpme")
+def api_set_material_tpme(mid: str, body: MaterialTpmeIn):
+    if not db.get_material(mid):
+        raise HTTPException(404, "material not found")
+    vals = body.model_dump(exclude_unset=True)
+    if "human_review_level" in vals and vals["human_review_level"] not in (None, "", *tpme.REVIEW_LEVELS):
+        raise HTTPException(400, f"human_review_level must be one of {', '.join(tpme.REVIEW_LEVELS)}")
+    if "media_language" in vals:
+        try:
+            vals["media_language"] = tpme.normalize_languages(vals["media_language"] or [])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    for k, v in vals.items():
+        if isinstance(v, str):
+            vals[k] = v.strip()
+    return {"tpme": db.set_material_tpme(mid, vals)}
 
 
 @app.delete("/api/materials/{mid}")
@@ -302,8 +383,12 @@ def _transcribe_params(body: TranscribeIn) -> dict:
         language = languages.normalize(body.language)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    try:
+        model, language = languages.resolve_model(body.model, language, settings.get("model", "large-v3"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     params = {
-        "model": body.model or settings.get("model", "large-v3"),
+        "model": model,
         "language": language,
         "diarize": body.diarize,
     }
@@ -400,18 +485,21 @@ def api_version(mid: str, version: int):
 
 @app.put("/api/materials/{mid}/transcription")
 def api_save_transcription(mid: str, body: SaveTranscriptionIn):
-    if not db.get_material(mid):
+    m = db.get_material(mid)
+    if not m:
         raise HTTPException(404, "material not found")
-    return db.save_version(mid, body.data, source="edit", note=body.note, editor=body.editor)
+    return db.save_version(mid, body.data, source="edit", note=body.note, editor=body.editor,
+                           meta=tpme.version_meta(m))
 
 
 @app.post("/api/materials/{mid}/versions/{version}/restore")
 def api_restore(mid: str, version: int, editor: str | None = None):
     v = db.get_version(mid, version)
-    if not v:
+    m = db.get_material(mid)
+    if not v or not m:
         raise HTTPException(404, "version not found")
     return db.save_version(mid, v["data"], source="restore", editor=editor,
-                           note=f"Restored from v{version}", meta={"restored_from": version})
+                           note=f"Restored from v{version}", meta={"restored_from": version, **tpme.version_meta(m)})
 
 
 @app.get("/api/materials/{mid}/versions/{version}/tpme")
@@ -423,7 +511,7 @@ def api_tpme(mid: str, version: int, history: bool = False):
     settings = db.get_project_settings(m["project_id"])
     if history:
         return tpme.history(m, settings, upto=version)
-    return tpme.build_record(m, v, settings)
+    return tpme.build_record(m, v, settings, scan_summary=tpme.last_scan(mid, version))
 
 
 # ---------------------------------------------------------------- scan / export / runs

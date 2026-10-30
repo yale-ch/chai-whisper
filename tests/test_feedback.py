@@ -196,17 +196,107 @@ class TestEditorsAndTPME(unittest.TestCase):
         v2 = tpme.build_record(m, self.db.get_version(m["id"], 2), settings, fmt="vtt", file_bytes=b"WEBVTT\n")
         self.assertEqual(v2["transcript_id"], f"{m['id']}-v2")
         self.assertEqual(v2["parent_transcript_id"], f"{m['id']}-v1")
-        self.assertEqual(v2["human_review_level"], "human-corrected")
-        self.assertEqual(v2["human_agent"], "Ann")
+        self.assertEqual(v2["human_review_level"], "partially-edited")  # derived until the user picks
+        self.assertEqual(v2["human_agent"], ["Ann"])
+        self.assertEqual(v2["media_id"], "int")
+        self.assertEqual(v2["originating_media_file"], "int.wav")
+        self.assertEqual(v2["media_language"], ["en"])
         self.assertEqual(v2["provider"], "Test Library")
         self.assertEqual(v2["file_format"], "WebVTT")
         self.assertTrue(v2["transcript_checksum"].startswith("sha256:"))
         self.assertTrue(v2["features"]["speaker_identification"])  # "Alice" is a real name
         hist = tpme.history(m, settings)
         self.assertEqual([r["transcript_id"].rsplit("-", 1)[1] for r in hist], ["v3", "v2", "v1"])
-        self.assertEqual(hist[0]["human_review_level"], "machine-generated")  # restored v1 = machine output
+        self.assertEqual(hist[0]["human_review_level"], "unedited")  # restored v1 = machine output
+        self.assertTrue(all(r["media_language"] == ["en"] for r in hist))  # in every record, not just v1
         asr = [s for s in hist[2]["processing"] if s.get("application_type") == "ASR"][0]
         self.assertEqual(asr["inference_model"], "large-v3")
+
+    def test_tpme_user_fields(self):
+        from app import exports, scan, tpme
+        p = self.db.create_project("P")
+        self.db.save_project_settings(p["id"], {"provider": "Default Lib", "conventions": "Guide v1"})
+        mid = self.db.create_material(p["id"], "tape3.mp4", "/x/tape3.mp4", "video",
+                                      tpme={"originating_media_file": "tape3.mp4"})["id"]
+        self.db.set_material_editors(mid, ["Ann", "Bo"])
+        self.db.set_material_tpme(mid, {"media_title": "'Compass', Great Tapes (3 of 3)", "provider": "Fortunoff",
+                                        "media_language": tpme.normalize_languages(["yid", "English", "lad"]),
+                                        "human_review_level": "full-edited"})
+        self.db.save_version(mid, {**DATA, "language": "yi"}, source="run",
+                             meta={"params": {"model": "large-v3", "language": "yi"}})
+        self.db.save_version(mid, DATA, source="edit", editor="Cy",
+                             meta=tpme.version_meta(self.db.get_material(mid)))
+        m = self.db.get_material(mid)
+        settings = self.db.get_project_settings(p["id"])
+        rec = tpme.build_record(m, self.db.get_version(mid, 2), settings)
+        self.assertEqual(rec["media_id"], "tape3")
+        self.assertEqual(rec["media_title"], "'Compass', Great Tapes (3 of 3)")
+        self.assertEqual(rec["originating_media_file"], "tape3.mp4")
+        self.assertEqual(rec["provider"], "Fortunoff")          # per-recording override
+        self.assertEqual(rec["conventions"], "Guide v1")        # project default
+        self.assertEqual(rec["media_language"], ["yi", "en", "lad"])
+        self.assertEqual(rec["human_review_level"], "full-edited")
+        self.assertEqual(rec["human_agent"], ["Ann", "Bo", "Cy"])
+        # Older version keeps its own (derived) level; changing the setting only moves the latest.
+        self.db.set_material_tpme(mid, {"human_review_level": "partially-edited"})
+        m = self.db.get_material(mid)
+        self.assertEqual(tpme.build_record(m, self.db.get_version(mid, 1), settings)["human_review_level"], "unedited")
+        self.assertEqual(tpme.build_record(m, self.db.get_version(mid, 2), settings)["human_review_level"], "partially-edited")
+        with self.assertRaises(ValueError):
+            tpme.normalize_languages(["not a language"])
+
+        # Export documents the scan + lexicons, and can embed the version chain.
+        lx = self.db.create_lexicon("Harmful terms", ["Alice"])
+        exports.EXPORTS_ROOT = __import__("pathlib").Path(self.tmp) / "exports"
+        self.db.save_project_settings(p["id"], {"tpme_history": "embedded"})
+        run = exports.write_run(m, 2, DATA, ["vtt"], {"enabled": True, "lexicon_ids": [lx["id"]], "format": "vtt"})
+        import json, pathlib
+        folder = pathlib.Path(run["folder_path"])
+        side = json.loads((folder / "tape3.vtt.tpme.json").read_text())
+        step = [s for s in side["processing"] if s["application_type"] == "sensitive-language scan"][0]
+        self.assertEqual(step["application_parameters"]["lexicons"], [{"name": "Harmful terms", "term_count": 1}])
+        self.assertEqual([r["transcript_id"] for r in side["version_history"]], [f"{mid}-v1"])
+        self.assertFalse(list(folder.glob("*.tpme-history.json")))
+        # The provenance view picks up the recorded scan.
+        self.assertTrue(any(s["application_type"] == "sensitive-language scan"
+                            for s in tpme.build_record(m, self.db.get_version(mid, 2), settings,
+                                                       scan_summary=tpme.last_scan(mid, 2))["processing"]))
+
+
+class TestPlaybackAndScript(unittest.TestCase):
+    def test_playback_issue(self):
+        from app.media import playback_issue
+        aac = {"codec": "aac", "profile": "LC", "channels": 2}
+        ok = {"has_audio": True, "audio_streams": [aac]}
+        self.assertIsNone(playback_issue("a.mp4", ok))
+        self.assertIn("2 audio tracks", playback_issue("a.mp4", {"has_audio": True, "audio_streams": [aac, aac]}))
+        self.assertIn("6-channel", playback_issue("a.mp4", {"has_audio": True, "audio_streams": [{**aac, "channels": 6}]}))
+        self.assertIn("ac3", playback_issue("a.mp4", {"has_audio": True, "audio_streams": [{"codec": "ac3"}]}))
+        self.assertIn("Main", playback_issue("a.mp4", {"has_audio": True, "audio_streams": [{**aac, "profile": "Main"}]}))
+        self.assertIn(".avi", playback_issue("a.avi", ok))
+        self.assertIsNone(playback_issue("a.wav", {"has_audio": True, "audio_streams": [{"codec": "pcm_s16le"}]}))
+
+    def test_script_mismatch(self):
+        from app.ingest import script_mismatch
+        eng = {"segments": [{"text": "I was born in a small town near Vilna, and my father was a tailor."}]}
+        yid = {"segments": [{"text": "איך בין געבוירן געוואָרן אין אַ קליין שטעטל לעבן ווילנע, און מײַן טאַטע איז געווען אַ שנײַדער."}]}
+        self.assertIn("translated", script_mismatch("yi", eng))
+        self.assertIsNone(script_mismatch("yi", yid))
+        self.assertIsNone(script_mismatch("en", eng))
+        self.assertIsNone(script_mismatch(None, eng))
+
+
+class TestLanguageModels(unittest.TestCase):
+    def test_resolve(self):
+        from app.languages import resolve_model, LANGUAGE_MODELS
+        self.assertEqual(resolve_model("auto", "yi"), (LANGUAGE_MODELS["yi"], "yi"))
+        self.assertEqual(resolve_model(None, "he"), (LANGUAGE_MODELS["he"], "he"))
+        self.assertEqual(resolve_model("auto", "en"), ("large-v3", "en"))
+        self.assertEqual(resolve_model("auto", None), ("large-v3", None))
+        self.assertEqual(resolve_model("large-v3", "yi"), ("large-v3", "yi"))   # explicit choice wins
+        self.assertEqual(resolve_model(LANGUAGE_MODELS["yi"], None), (LANGUAGE_MODELS["yi"], "yi"))  # forced
+        with self.assertRaises(ValueError):
+            resolve_model(LANGUAGE_MODELS["he"], "en")
 
 
 if __name__ == "__main__":

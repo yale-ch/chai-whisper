@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS materials (
     position INTEGER DEFAULT 0,
     editors_json TEXT,                 -- JSON list of editor names assigned to this recording
     has_audio INTEGER,                 -- 1/0 from ffprobe; NULL = unknown (older rows)
+    tpme_json TEXT,                    -- per-recording TPME fields entered by the user (see tpme.MATERIAL_FIELDS)
+    audio_rev INTEGER,                 -- media.AUDIO_REV the playback-audio check last ran at
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS lexicons (
@@ -81,7 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_material ON runs(material_id);
 """
 
 DEFAULT_SETTINGS = {
-    "model": "large-v3",
+    "model": "auto",
     "diarize": "true",
 }
 
@@ -93,7 +95,9 @@ DEFAULT_PROJECT_SETTINGS = {
     "scan_format": "txt",
     "editor_name": "",          # legacy (editors are now per recording); kept for old rows
     "tpme_enabled": True,       # write TPME provenance sidecars with each export
-    "provider": "",             # TPME `provider` (e.g. "Yale University Library")
+    "provider": "",             # default TPME `provider` (holding repository) for new recordings
+    "conventions": "",          # default TPME `conventions` (transcription style guide)
+    "tpme_history": "separate", # version chain: "separate" .tpme-history.json | "embedded" in each sidecar
 }
 
 
@@ -136,6 +140,8 @@ def init_db():
             "ALTER TABLE materials ADD COLUMN source_url TEXT",
             "ALTER TABLE materials ADD COLUMN editors_json TEXT",
             "ALTER TABLE materials ADD COLUMN has_audio INTEGER",
+            "ALTER TABLE materials ADD COLUMN tpme_json TEXT",
+            "ALTER TABLE materials ADD COLUMN audio_rev INTEGER",
             "ALTER TABLE transcription_versions ADD COLUMN editor TEXT",
             "ALTER TABLE transcription_versions ADD COLUMN meta_json TEXT",
         ):
@@ -272,6 +278,7 @@ def delete_project(pid: str):
 # ---------------------------------------------------------------- materials
 def _material_out(m: dict) -> dict:
     m["editors"] = json.loads(m.pop("editors_json", None) or "[]")
+    m["tpme"] = json.loads(m.pop("tpme_json", None) or "{}")
     if m.get("has_audio") is not None:
         m["has_audio"] = bool(m["has_audio"])
     return m
@@ -279,7 +286,7 @@ def _material_out(m: dict) -> dict:
 
 def create_material(project_id: str, name: str, media_path: str, media_type: str,
                     duration=None, width=None, height=None, source="file", source_url=None,
-                    has_audio=None) -> dict:
+                    has_audio=None, tpme: dict | None = None, audio_rev: int | None = None) -> dict:
     mid = new_id()
     conn = connect()
     try:
@@ -287,10 +294,10 @@ def create_material(project_id: str, name: str, media_path: str, media_type: str
                            (project_id,)).fetchone()[0]
         conn.execute("""INSERT INTO materials
             (id, project_id, name, media_path, media_type, source, source_url, duration, width, height,
-             position, has_audio)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             position, has_audio, tpme_json, audio_rev)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (mid, project_id, name, media_path, media_type, source, source_url, duration, width, height,
-             pos, None if has_audio is None else int(bool(has_audio))))
+             pos, None if has_audio is None else int(bool(has_audio)), json.dumps(tpme or {}), audio_rev))
         conn.commit()
         return _material_out(_row(conn, "SELECT * FROM materials WHERE id = ?", (mid,)))
     finally:
@@ -330,6 +337,25 @@ def set_material_editors(mid: str, editors: list[str]) -> list[str]:
     return out
 
 
+def set_material_tpme(mid: str, values: dict) -> dict:
+    """Merge user-entered TPME fields into a recording's record; ``None``/blank
+    values clear a field (so it falls back to the project default)."""
+    conn = connect()
+    try:
+        row = _row(conn, "SELECT tpme_json FROM materials WHERE id = ?", (mid,))
+        cur = json.loads((row or {}).get("tpme_json") or "{}")
+        for k, v in values.items():
+            if v in (None, "", []):
+                cur.pop(k, None)
+            else:
+                cur[k] = v
+        conn.execute("UPDATE materials SET tpme_json = ? WHERE id = ?", (json.dumps(cur), mid))
+        conn.commit()
+        return cur
+    finally:
+        conn.close()
+
+
 def is_owned_media(media_path: str) -> bool:
     """True for files we copied into our data dir (uploads / IIIF cache)."""
     try:
@@ -338,13 +364,13 @@ def is_owned_media(media_path: str) -> bool:
         return False
 
 
-def update_material_media(mid: str, media_path: str, info: dict):
+def update_material_media(mid: str, media_path: str, info: dict, audio_rev: int | None = None):
     conn = connect()
     try:
         conn.execute("""UPDATE materials SET media_path = ?, media_type = ?, duration = ?, width = ?,
-            height = ?, has_audio = ? WHERE id = ?""",
+            height = ?, has_audio = ?, audio_rev = COALESCE(?, audio_rev) WHERE id = ?""",
             (media_path, info["media_type"], info["duration"], info["width"], info["height"],
-             None if info.get("has_audio") is None else int(bool(info["has_audio"])), mid))
+             None if info.get("has_audio") is None else int(bool(info["has_audio"])), audio_rev, mid))
         conn.commit()
     finally:
         conn.close()

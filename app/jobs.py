@@ -18,7 +18,7 @@ import time
 import uuid
 
 from src import audio, remote
-from . import db, exports, ingest
+from . import db, exports, ingest, media, tpme
 
 _jobs: dict[str, dict] = {}
 _lock = threading.Lock()
@@ -40,7 +40,7 @@ def get(job_id: str):
 
 _PUBLIC = ("id", "kind", "status", "stage", "error", "audio_kb", "version", "progress", "count",
            "run_folder", "export_error", "material_id", "material_name", "project_id",
-           "label", "created", "finished")
+           "label", "created", "finished", "warning")
 
 
 def public(j: dict) -> dict:
@@ -122,7 +122,12 @@ def _run(job_id: str):
             "audio_preprocessing": "-vn -ac 1 -c:a libopus -b:a 16k -f ogg",
             "chai_version": st.get("chai_version"),
             "started": job.get("started"),
+            **tpme.version_meta(material),
         }
+        warning = ingest.script_mismatch(params.get("language"), data)
+        if warning:
+            meta["language_warning"] = warning
+            note += " — " + warning
         ver = db.save_version(mid, data, source="run", note=note, model=params.get("model"),
                               editor=job.get("requested_by"), meta=meta)
 
@@ -140,7 +145,8 @@ def _run(job_id: str):
         except Exception as ex:  # export failure shouldn't lose the transcript
             _set(job_id, export_error=f"{type(ex).__name__}: {ex}")
 
-        _set(job_id, status="done", stage="done", version=ver["version"], finished=time.time())
+        _set(job_id, status="done", stage="done", version=ver["version"], finished=time.time(),
+             warning=warning)
     except Exception as e:  # noqa: BLE001
         _set(job_id, status="error", stage="error", error=f"{type(e).__name__}: {e}", finished=time.time())
 
@@ -204,4 +210,49 @@ def submit_iiif(project_id: str, manifest_url: str) -> str:
                          "label": f"IIIF import · {manifest_url}",
                          "created": time.time()}
     _q.put(job_id)
+    return job_id
+
+
+def _run_media_fix(job_id: str):
+    """Re-encode a recording's sound so the browser plays it (see
+    media.ensure_browser_audio). Files we own are replaced; files referenced in
+    place are left untouched and a playable copy goes into the media store."""
+    with _lock:
+        job = dict(_jobs.get(job_id, {}))
+    _set(job_id, status="running", stage="re-encoding audio for playback", started=time.time())
+    try:
+        m = db.get_material(job["material_id"])
+        if not m or not m.get("media_exists"):
+            raise RuntimeError("media file not found on disk")
+        owned = db.is_owned_media(m["media_path"])
+        dest_dir = None
+        if not owned:
+            dest_dir = ingest.MEDIA_STORE / m["project_id"]
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        info = media.probe(m["media_path"])
+        path, new = media.ensure_browser_audio(m["media_path"], info, force=True,
+                                               dest_dir=str(dest_dir) if dest_dir else None,
+                                               keep_source=not owned)
+        if path == m["media_path"]:
+            raise RuntimeError("ffmpeg could not re-encode this file's audio")
+        db.update_material_media(m["id"], path, new, audio_rev=media.AUDIO_REV)
+        _set(job_id, status="done", stage="done", finished=time.time())
+    except Exception as e:  # noqa: BLE001
+        _set(job_id, status="error", stage="error", error=f"{type(e).__name__}: {e}", finished=time.time())
+
+
+def submit_media_fix(material_id: str) -> str:
+    """Runs on its own thread — a quick ffmpeg pass shouldn't wait behind
+    queued DGX transcriptions."""
+    m = db.get_material(material_id) or {}
+    with _lock:
+        for j in _jobs.values():
+            if j.get("kind") == "media" and j.get("material_id") == material_id and j["status"] in ("queued", "running"):
+                return j["id"]
+        job_id = uuid.uuid4().hex[:12]
+        _jobs[job_id] = {"id": job_id, "status": "queued", "stage": "queued", "kind": "media",
+                         "material_id": material_id, "material_name": m.get("name"),
+                         "project_id": m.get("project_id"), "label": f"Fix playback audio · {m.get('name')}",
+                         "created": time.time()}
+    threading.Thread(target=_run_media_fix, args=(job_id,), daemon=True).start()
     return job_id

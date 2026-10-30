@@ -2,8 +2,9 @@
 
 Each transcription/export run writes its selected format files, an optional
 sensitive-language scan report (txt/json/csv), TPME provenance sidecars (one
-``<file>.tpme.json`` per transcript file, plus the version chain in
-``<name>.tpme-history.json``), and a manifest into its own timestamped folder
+``<file>.tpme.json`` per transcript file, plus the version chain — in
+``<name>.tpme-history.json`` or embedded in each sidecar as ``version_history``,
+per the project's ``tpme_history`` setting), and a manifest into its own timestamped folder
 under the exports root (CHAI_WHISPER_EXPORTS or data/exports), and records a
 ``runs`` row. Mirrors chai-docs' export-folder pattern.
 """
@@ -45,6 +46,26 @@ def write_run(material: dict, version: int, data: dict, formats: list[str],
         tpme_enabled = bool(settings.get("tpme_enabled", True))
     vrow = db.get_version(material["id"], version) if tpme_enabled else None
 
+    # Scan first, so the TPME sidecars can document it (and which lexicons).
+    scan_summary = {"enabled": False}
+    if scan_cfg and scan_cfg.get("enabled"):
+        ids = scan_cfg.get("lexicon_ids") or []
+        terms = db.get_lexicon_terms(ids)
+        result = scan.scan_data(data, terms, scan_cfg.get("format", "txt"))
+        (folder / "report.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        (folder / "report.txt").write_text(scan.report_text(result), encoding="utf-8")
+        (folder / "report.csv").write_text(scan.report_csv(result), encoding="utf-8", newline="")
+        lexicons = [{"id": lx["id"], "name": lx["name"], "term_count": lx["term_count"]}
+                    for lx in db.list_lexicons() if not ids or lx["id"] in ids]
+        scan_summary = {"enabled": True, "lexicon_ids": ids, "lexicons": lexicons,
+                        "format": result["format"], "flag_count": result["flag_count"],
+                        "terms_hit": result["terms_hit"],
+                        "scanned_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+
+    # No scan this time → document the newest earlier scan of this version, if any.
+    tpme_scan = scan_summary if scan_summary["enabled"] else tpme.last_scan(material["id"], version)
+    embed_history = settings.get("tpme_history") == "embedded"
+    earlier = tpme.history(material, settings, upto=version - 1) if vrow and embed_history else []
     written = []
     for fmt in formats:
         if fmt not in exporters.RENDERERS:
@@ -54,24 +75,18 @@ def write_run(material: dict, version: int, data: dict, formats: list[str],
         path.write_bytes(body)
         written.append(fmt)
         if vrow:
-            rec = tpme.build_record(material, {**vrow, "data": data}, settings, fmt=fmt, file_bytes=body)
+            rec = tpme.build_record(material, {**vrow, "data": data}, settings, fmt=fmt, file_bytes=body,
+                                    scan_summary=tpme_scan)
+            if embed_history:
+                rec["version_history"] = earlier
             (folder / f"{path.name}.tpme.json").write_text(
                 json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
-    if vrow:
+    if vrow and not embed_history:
+        hist = tpme.history(material, settings, upto=version)
+        if hist and scan_summary["enabled"]:  # this export's scan isn't recorded as a run yet
+            hist[0] = tpme.build_record(material, {**vrow, "data": data}, settings, scan_summary=scan_summary)
         (folder / f"{mat_name}.tpme-history.json").write_text(
-            json.dumps(tpme.history(material, settings, upto=version), ensure_ascii=False, indent=2),
-            encoding="utf-8")
-
-    scan_summary = {"enabled": False}
-    if scan_cfg and scan_cfg.get("enabled"):
-        terms = db.get_lexicon_terms(scan_cfg.get("lexicon_ids") or [])
-        result = scan.scan_data(data, terms, scan_cfg.get("format", "txt"))
-        (folder / "report.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        (folder / "report.txt").write_text(scan.report_text(result), encoding="utf-8")
-        (folder / "report.csv").write_text(scan.report_csv(result), encoding="utf-8", newline="")
-        scan_summary = {"enabled": True, "lexicon_ids": scan_cfg.get("lexicon_ids") or [],
-                        "format": result["format"], "flag_count": result["flag_count"],
-                        "terms_hit": result["terms_hit"]}
+            json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
 
     manifest = {
         "material": material["name"], "material_id": material["id"],

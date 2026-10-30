@@ -96,7 +96,12 @@ async function render() {
 }
 window.addEventListener("hashchange", render);
 window.addEventListener("beforeunload", (e) => { if (V.dirty) { e.preventDefault(); e.returnValue = ""; } });
-window.addEventListener("load", () => { refreshStatus(); setInterval(refreshStatus, 20000); render(); refreshJobs(); });
+window.addEventListener("load", () => { refreshStatus(); setInterval(refreshStatus, 20000); render(); refreshJobs(); showBuild(); });
+async function showBuild() {
+  try { const v = await api("/api/version"); const el = $("buildInfo");
+    if (el) { el.textContent = `v${v.version}${v.build ? " · " + v.build : ""}`; el.title = "Running version (commit · date) — include this when reporting issues"; }
+  } catch {}
+}
 
 // ---------------- background jobs tray ----------------
 // Transcriptions and IIIF imports run on the server; the browser only watches.
@@ -120,12 +125,17 @@ function onJobFinished(j) {
   if (j.status === "error") { toast(`${j.label || "Job"} failed: ${j.error}`, true); return; }
   const onMaterial = CURRENT_HASH === `#/material/${j.material_id}`;
   const onProject = CURRENT_HASH === `#/project/${j.project_id}`;
+  if (j.kind === "media") {
+    toast(`Playback audio fixed for ${j.material_name}`);
+    if (onMaterial && !V.dirty) viewMaterial(j.material_id);
+    return;
+  }
   if (j.kind === "iiif") {
     toast(`IIIF import added ${j.count} recording(s)` + (j.export_error ? ` — ${j.export_error}` : ""), !!j.export_error);
     if (onProject) viewProject(j.project_id);
     return;
   }
-  toast(`Transcribed ${j.material_name} → v${j.version}`);
+  toast(`Transcribed ${j.material_name} → v${j.version}` + (j.warning ? ` — warning: ${j.warning}` : ""), !!j.warning);
   if (onProject) viewProject(j.project_id);
   if (onMaterial) {
     if (!V.dirty) viewMaterial(j.material_id);
@@ -144,11 +154,11 @@ function renderTray() {
   const summary = [running && `${running} running`, queued && `${queued} queued`, failed && `${failed} failed`].filter(Boolean).join(" · ") || "all done";
   tray.className = JOBS.minimized ? "min" : "";
   const item = (j) => {
-    const link = j.kind === "transcribe" ? `#/material/${j.material_id}` : `#/project/${j.project_id}`;
+    const link = j.material_id ? `#/material/${j.material_id}` : `#/project/${j.project_id}`;
     const chip = { queued: `<span class="chip gray">queued${j.position ? " #" + j.position : ""}</span>`, running: `<span class="spinner"></span>`,
-      done: `<span class="chip green">${j.kind === "iiif" ? "imported " + (j.count ?? "") : "v" + j.version}</span>`,
+      done: `<span class="chip ${j.warning ? "orange" : "green"}">${j.kind === "iiif" ? "imported " + (j.count ?? "") : j.kind === "media" ? "fixed" : "v" + j.version}</span>`,
       error: `<span class="chip orange">failed</span>`, cancelled: `<span class="chip gray">cancelled</span>` }[j.status] || "";
-    const detail = j.status === "error" ? j.error : j.status === "running" ? (j.stage || "") + (j.progress != null ? ` ${j.progress}%` : "") : (j.export_error || "");
+    const detail = j.status === "error" ? j.error : j.status === "running" ? (j.stage || "") + (j.progress != null ? ` ${j.progress}%` : "") : (j.warning || j.export_error || "");
     const act = j.status === "queued" ? `<button class="small secondary job-cancel" data-id="${j.id}">cancel</button>`
       : j.status === "running" ? "" : `<button class="del-x job-dismiss" data-id="${j.id}" title="Clear">✕</button>`;
     return `<div class="job-item ${j.status}"><div class="job-main">${chip}<a href="${link}" class="job-label" title="${esc(j.label)}">${esc(j.label || j.kind)}</a></div>
@@ -341,9 +351,16 @@ async function viewProject(pid) {
           <select id="scanFmt">${SCAN_FORMATS.map((f)=>`<option ${S.scan_format===f?"selected":""}>${f}</option>`).join("")}</select></label>
       </div>
       <label class="toggle" style="margin-bottom:8px"><input type="checkbox" id="tpmeDefault" ${S.tpme_enabled!==false?"checked":""}> write TPME provenance sidecars with every export</label>
-      <label class="field"><span>Provider (TPME <code>provider</code>, e.g. your library or unit)</span>
-        <input id="tpmeProvider" type="text" value="${esc(S.provider||"")}" placeholder="e.g. Yale University Library, Manuscripts &amp; Archives"></label>
-      <div class="muted" style="margin-bottom:8px">Editors are assigned per recording — select recordings below and use “Assign editors”, or set them in a recording’s Editors panel.</div>
+        <label class="field"><span>Default provider <span class="hint">(TPME <code>provider</code> — holding repository; each recording can override)</span></span>
+          <input id="tpmeProvider" type="text" value="${esc(S.provider||"")}" placeholder="e.g. Fortunoff Video Archive for Holocaust Testimonies"></label>
+        <label class="field"><span>Default conventions <span class="hint">(TPME <code>conventions</code> — transcription style guide)</span></span>
+          <input id="tpmeConventions" type="text" value="${esc(S.conventions||"")}" placeholder="e.g. style guide name, version or URL"></label>
+      <label class="field"><span>TPME version history</span>
+        <select id="tpmeHistory">
+          <option value="separate" ${S.tpme_history!=="embedded"?"selected":""}>separate file (&lt;name&gt;.tpme-history.json)</option>
+          <option value="embedded" ${S.tpme_history==="embedded"?"selected":""}>embedded in each sidecar (version_history array)</option>
+        </select></label>
+      <div class="muted" style="margin-bottom:8px">Editors, media title, media language(s), review level and the rest of the TPME fields are set <b>per recording</b> — open a recording, or select several below and use “Assign editors”.</div>
       <button id="saveDefaults" class="small">Save defaults</button>
     </div>
 
@@ -414,6 +431,8 @@ async function viewProject(pid) {
       scan_format: $("scanFmt").value,
       tpme_enabled: $("tpmeDefault").checked,
       provider: $("tpmeProvider").value.trim(),
+      conventions: $("tpmeConventions").value.trim(),
+      tpme_history: $("tpmeHistory").value,
     };
     await api(`/api/projects/${pid}/settings`, { method: "PUT", json: body });
     toast("Defaults saved");
@@ -602,6 +621,7 @@ async function viewMaterial(mid) {
         ${mediaHTML(material)}
         <div class="now-playing" id="nowPlaying"></div>
         <div class="card" id="editorsCard"></div>
+        <div class="card" id="tpmeCard"></div>
         <div class="card speakers" id="speakers"></div>
         <div class="card" id="scanCard"></div>
         <div class="card" id="notesCard"></div>
@@ -612,9 +632,10 @@ async function viewMaterial(mid) {
     </div>`;
 
   wireToolbar(material);
+  wireMediaFix(material);
   V.media = view().querySelector("video, audio");
   if (V.media) V.media.addEventListener("timeupdate", onTimeUpdate);
-  renderEditorsCard(); renderSpeakers(); renderTranscript(); renderScanCard(); renderNotesCard(); renderExportCard();
+  renderEditorsCard(); renderTpmeCard(); renderSpeakers(); renderTranscript(); renderScanCard(); renderNotesCard(); renderExportCard();
   await loadStats();
   await runScan(); // auto-scan with project default lexicons
 }
@@ -638,7 +659,14 @@ function toolbarHTML(m) {
 function mediaHTML(m) {
   if (!m.media_exists) return `<div class="media-missing">Media file not found on disk:<br><code>${esc(m.media_path)}</code></div>`;
   const src = `/api/materials/${m.id}/media`;
-  const warn = m.has_audio === false ? `<div class="media-missing" style="margin-top:8px">This file has no audio track, so there is nothing to transcribe. If it came from a IIIF manifest, the publisher may serve audio separately — try re-importing (audio is now merged in automatically when offered).</div>` : "";
+  let warn = m.has_audio === false ? `<div class="media-missing" style="margin-top:8px">This file has no audio track, so there is nothing to transcribe. If it came from a IIIF manifest, the publisher may serve audio separately — try re-importing (audio is now merged in automatically when offered).</div>` : "";
+  if (m.has_audio !== false) {
+    warn += m.media_fix_running
+      ? `<div class="media-note"><span class="spinner"></span> Re-encoding the audio so it plays in the browser — this page reloads when it’s done.</div>`
+      : m.playback_issue
+        ? `<div class="media-note warn">Sound may not play in the browser: ${esc(m.playback_issue)}. Transcription is not affected. <button class="small" id="fixAudio">Fix playback audio</button></div>`
+        : `<div class="media-note"><a href="#" id="fixAudio" class="muted">No sound? Re-encode the audio for playback</a></div>`;
+  }
   if (m.media_type === "video") return `<div class="stage"><video id="media" controls preload="metadata" src="${src}"></video></div>${warn}`;
   return `<div class="audio-wrap"><audio id="media" controls preload="metadata" src="${src}"></audio></div>${warn}`;
 }
@@ -683,11 +711,67 @@ function wireToolbar(m) {
   };
 }
 
+function wireMediaFix(m) {
+  const b = $("fixAudio"); if (!b) return;
+  b.onclick = async (e) => {
+    e.preventDefault();
+    if (!confirm("Re-encode this recording's audio to stereo AAC so the browser can play it? The video picture is kept as is; files referenced in place are not modified (a playable copy is made). " +
+      "This takes a few seconds to a couple of minutes.")) return;
+    try { await api(`/api/materials/${m.id}/fix-audio`, { method: "POST" }); toast("Fixing playback audio — see the jobs tray"); kickJobs(); }
+    catch (err) { toast(err.message, true); }
+  };
+}
+
+// ---- recording metadata (TPME, per recording) ----
+const REVIEW_LEVELS = ["unedited", "partially-edited", "full-edited"];
+function renderTpmeCard() {
+  const c = $("tpmeCard"); const T = V.material.tpme || {}; const S = V.projSettings || {};
+  const langs = T.media_language || [];
+  const detected = (V.data && typeof V.data.language === "string") ? V.data.language : "";
+  c.innerHTML = `<h3 style="margin-top:0">Recording metadata <span class="hint">(TPME)</span></h3>
+    <label class="field"><span>Media title <span class="hint">(as listed in the catalog / Aviary)</span></span>
+      <input id="tmTitle" type="text" value="${esc(T.media_title || "")}" placeholder="e.g. ‘Maxine Kumin Compass’, Great Tapes (3 of 3)"></label>
+    <div class="kv"><span class="muted">media_id</span> <code>${esc((V.material.name || "").replace(/\.[^.]+$/, ""))}</code></div>
+    <label class="field"><span>Originating media file</span>
+      <input id="tmFile" type="text" value="${esc(T.originating_media_file || "")}" placeholder="${esc(/\.[^.]+$/.test(V.material.name || "") ? V.material.name + " (from the file name)" : "file name with extension")}"></label>
+    <label class="field"><span>Provider <span class="hint">(holding repository)</span></span>
+      <input id="tmProvider" type="text" value="${esc(T.provider || "")}" placeholder="${esc(S.provider ? "project default: " + S.provider : "e.g. Fortunoff Video Archive")}"></label>
+    <label class="field"><span>Conventions <span class="hint">(transcription style guide)</span></span>
+      <input id="tmConventions" type="text" value="${esc(T.conventions || "")}" placeholder="${esc(S.conventions ? "project default: " + S.conventions : "style guide name / URL")}"></label>
+    <label class="field"><span>Human review level</span>
+      <select id="tmReview"><option value="">— not set (derived from edit history) —</option>
+        ${REVIEW_LEVELS.map((l) => `<option ${T.human_review_level === l ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+    <div class="field"><span>Media language(s) <span class="hint">${langs.length ? "" : detected ? `(not set — Whisper’s <code>${esc(detected)}</code> is used)` : "(not set)"}</span></span>
+      <div class="row" style="gap:6px;margin-top:4px">${langs.map((l) => `<span class="chip">${esc(l)} <button class="chip-x" data-lang="${esc(l)}" title="Remove">✕</button></span>`).join("")}
+        <input id="tmLang" type="text" list="tmLangList" placeholder="add: yi / yid / Yiddish" style="width:150px">
+        <datalist id="tmLangList">${(LANGS || []).map((l) => `<option value="${l.code}">${esc(l.name)}</option>`).join("")}</datalist>
+        <button class="small secondary" id="tmLangAdd">add</button></div></div>
+    <div class="row" style="margin-top:10px"><button class="small" id="tmSave">Save metadata</button><span id="tmMsg" class="muted"></span></div>`;
+  if (!LANGS) api("/api/languages").then((l) => { LANGS = l; const dl = $("tmLangList"); if (dl) dl.innerHTML = l.map((x) => `<option value="${x.code}">${esc(x.name)}</option>`).join(""); }).catch(() => {});
+  const put = async (body, msg) => {
+    try { const r = await api(`/api/materials/${V.mid}/tpme`, { method: "PUT", json: body });
+      V.material.tpme = r.tpme; renderTpmeCard(); toast(msg || "Metadata saved"); }
+    catch (e) { toast(e.message, true); }
+  };
+  const dirty = () => { $("tmMsg").textContent = "unsaved changes"; };
+  c.querySelectorAll("input:not(#tmLang), select").forEach((el) => el.addEventListener("input", dirty));
+  $("tmSave").onclick = () => put({
+    media_title: $("tmTitle").value, originating_media_file: $("tmFile").value, provider: $("tmProvider").value,
+    conventions: $("tmConventions").value, human_review_level: $("tmReview").value || null });
+  const addLang = () => {
+    const v = $("tmLang").value.split(",").map((x) => x.trim()).filter(Boolean); if (!v.length) return;
+    put({ media_language: [...langs, ...v] }, "Media language saved");
+  };
+  $("tmLangAdd").onclick = addLang;
+  $("tmLang").onkeydown = (e) => { if (e.key === "Enter") addLang(); };
+  c.querySelectorAll(".chip-x[data-lang]").forEach((b) => b.onclick = () => put({ media_language: langs.filter((l) => l !== b.dataset.lang) }, "Media language removed"));
+}
+
 // ---- editors (per recording) ----
 function renderEditorsCard() {
   const c = $("editorsCard"); const eds = V.material.editors || [];
   const me = currentEditor();
-  c.innerHTML = `<div class="row" style="justify-content:space-between"><h3 style="margin:0">Editors</h3>
+  c.innerHTML = `<div class="row" style="justify-content:space-between"><h3 style="margin:0">Editors <span class="hint">(TPME human_agent)</span></h3>
       <button class="small secondary" id="edAdd">+ add</button></div>
     <div class="row" style="margin-top:8px;gap:6px">${eds.length ? eds.map((e) => `<span class="chip editor">✎ ${esc(e)} <button class="chip-x" data-ed="${esc(e)}" title="Remove">✕</button></span>`).join("")
       : `<span class="muted">No editors assigned to this recording.</span>`}</div>
@@ -951,13 +1035,22 @@ function jumpToSeg(segId, play = false) {
 function renderNotesCard() {
   const c = $("notesCard"); const notes = V.data.notes || [];
   const segOf = (id) => (V.data.segments || []).find((s) => s.id === id);
-  c.innerHTML = `<h3 style="margin-top:0">Notes ${notes.length ? `<span class="chip gray">${notes.filter((n)=>n.status!=="resolved").length} open</span>` : ""}</h3>` +
+  c.innerHTML = `<div class="row" style="justify-content:space-between"><h3 style="margin:0">Notes ${notes.length ? `<span class="chip gray">${notes.filter((n)=>n.status!=="resolved").length} open</span>` : ""}</h3>
+      ${(V.data.segments || []).length ? `<button class="small secondary" id="noteAdd" title="Add a note to the line that is playing (or the first line)">+ add note</button>` : ""}</div><div style="margin-top:8px"></div>` +
     (notes.length ? notes.map((n) => { const sg = segOf(n.seg_id); return `<div class="note-row ${n.status}">
       <div><b>${esc(n.author)}</b> · <span class="muted">${n.status}${sg ? " · " + fmtTs(sg.start) : ""}</span><div>${esc(n.text)}</div></div>
       <div class="row"><button class="small secondary note-jump" data-seg="${esc(n.seg_id)}">jump</button>
       <button class="small note-toggle" data-id="${esc(n.id)}">${n.status === "resolved" ? "reopen" : "resolve"}</button></div>
-    </div>`; }).join("") : `<div class="muted">No notes. Hover a line and click <b>📝 note</b> to leave a review comment.</div>`) +
+    </div>`; }).join("") : `<div class="muted">No notes. Click <b>📝 note</b> on any line (or “+ add note” for the line that’s playing) to leave a review comment.</div>`) +
     (V.dirty && notes.length ? `<div class="hint" style="margin-top:6px">Notes are saved with the transcript — click “Save edits”.</div>` : "");
+  const addBtn = $("noteAdd");
+  if (addBtn) addBtn.onclick = () => {
+    const segs = V.data.segments || [];
+    const target = segs.find((s) => s.id === V.activeId) || segs[0];
+    if (!target) return;
+    V.noteOpen = target.id; renderTranscript(); jumpToSeg(target.id);
+    const t = view().querySelector(".note-compose .nc-text"); if (t) t.focus();
+  };
   c.querySelectorAll(".note-jump").forEach((b) => b.onclick = () => jumpToSeg(b.dataset.seg, true));
   c.querySelectorAll(".note-toggle").forEach((b) => b.onclick = () => {
     const n = V.data.notes.find((x) => x.id === b.dataset.id); if (!n) return;
@@ -1075,7 +1168,7 @@ async function loadRuns() {
 // ---- transcribe dialog (one or many recordings) ----
 let LANGS = null;
 async function openTranscribe(mats, pid) {
-  const [settings, langs] = await Promise.all([api("/api/settings"), LANGS || api("/api/languages")]);
+  const [settings, langs, models] = await Promise.all([api("/api/settings"), LANGS || api("/api/languages"), api("/api/models")]);
   LANGS = langs;
   const many = mats.length > 1;
   const already = mats.filter((m) => m.transcribed || (m.versions && m.versions.length)).length;
@@ -1084,7 +1177,7 @@ async function openTranscribe(mats, pid) {
     ${many ? `<div class="muted" style="margin-bottom:10px">${mats.slice(0, 6).map((m) => esc(m.name)).join(", ")}${mats.length > 6 ? ` and ${mats.length - 6} more` : ""}.
       ${already ? `<br>${already} already transcribed — each gets a new version; nothing is overwritten.` : ""}</div>` : ""}
     <label class="field"><span>Model</span>
-      <select id="tModel">${["large-v3","medium","small","base","tiny"].map((x) => `<option ${x === settings.model ? "selected" : ""}>${x}</option>`).join("")}</select></label>
+      <select id="tModel">${models.map((x) => `<option value="${esc(x.id)}" data-lang="${esc(x.language || "")}" ${x.id === settings.model ? "selected" : ""}>${esc(x.label)}</option>`).join("")}</select></label>
     <label class="field"><span>Language <span class="hint">(blank = auto-detect; code like en / eng / en-US, or a name)</span></span>
       <input id="tLang" type="text" list="tLangList" placeholder="auto-detect">
       <datalist id="tLangList">${langs.map((l) => `<option value="${l.code}">${esc(l.name)} · ${l.iso639_2}${l.iso639_2b !== l.iso639_2 ? "/" + l.iso639_2b : ""}</option>`).join("")}</datalist></label>
@@ -1093,6 +1186,8 @@ async function openTranscribe(mats, pid) {
     <div class="muted" style="margin-bottom:10px">Runs in the background — progress shows in the jobs tray, so you can keep working (e.g. editing another transcript). Outputs (${(V.projSettings.output_formats || (PROJ && PROJ.settings && PROJ.settings.output_formats) || ["vtt","txt"]).join(", ")}) + scan are written per the project defaults.</div>
     <div class="row"><button id="tGo">${many ? `Queue ${mats.length} jobs` : "Start"}</button><button class="secondary" id="tCancel">Cancel</button><span class="grow"></span><span id="tErr" class="muted"></span></div>`);
   $("tCancel").onclick = () => panel.close();
+  // Language-specific fine-tunes can't detect language — fill it in for them.
+  $("tModel").onchange = () => { const l = $("tModel").selectedOptions[0].dataset.lang; if (l) $("tLang").value = l; };
   $("tGo").onclick = async () => {
     $("tGo").disabled = true;
     const body = { model: $("tModel").value, language: $("tLang").value.trim() || null, diarize: $("tDia").checked,

@@ -96,5 +96,37 @@ def describe(code: str | None) -> dict | None:
             "iso639_2": t, "iso639_2b": b or t}
 
 
+# Whisper fine-tunes that beat stock large-v3 for a language (CTranslate2
+# format, which the DGX's faster-whisper loads straight from Hugging Face).
+# Their language detection is degraded, so the language is always forced.
+LANGUAGE_MODELS = {
+    "yi": "ivrit-ai/yi-whisper-large-v3-turbo-ct2",   # ivrit-ai/yi-whisper-large-v3-turbo
+    "he": "ivrit-ai/whisper-large-v3-turbo-ct2",      # ivrit-ai/whisper-large-v3-turbo
+}
+MODELS = [
+    {"id": "auto", "label": "auto — best model for the language (ivrit-ai for Yiddish/Hebrew, else large-v3)"},
+    {"id": "large-v3", "label": "large-v3"},
+    {"id": LANGUAGE_MODELS["yi"], "label": "ivrit-ai Yiddish (yi-whisper-large-v3-turbo)", "language": "yi"},
+    {"id": LANGUAGE_MODELS["he"], "label": "ivrit-ai Hebrew (whisper-large-v3-turbo)", "language": "he"},
+    {"id": "medium", "label": "medium"}, {"id": "small", "label": "small"},
+    {"id": "base", "label": "base"}, {"id": "tiny", "label": "tiny"},
+]
+
+
+def resolve_model(model: str | None, language: str | None, default: str = "large-v3") -> tuple[str, str | None]:
+    """(model, language) to send to the DGX. ``auto``/blank picks the
+    language's fine-tune if there is one; a language-specific model forces its
+    language (it can't detect languages reliably)."""
+    if not model or model == "auto":
+        model = LANGUAGE_MODELS.get(language) or (default if default != "auto" else "large-v3")
+    for lang, m in LANGUAGE_MODELS.items():
+        if model == m:
+            if language and language != lang:
+                raise ValueError(f"{m} only transcribes {describe(lang)['name']} — "
+                                 f"pick another model for {describe(language)['name'] if describe(language) else language}")
+            language = lang
+    return model, language
+
+
 def all_languages() -> list[dict]:
     return sorted((describe(c) for c in _BY_CODE), key=lambda d: d["name"])

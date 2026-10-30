@@ -67,6 +67,38 @@ def data_from_dgx_result(result: dict) -> dict:
     return data
 
 
+# Languages whose text is not written in Latin script, by Unicode range.
+_SCRIPTS = {
+    "Hebrew": ("\u0590-\u05ff", {"yi", "he"}),
+    "Arabic": ("\u0600-\u06ff\u0750-\u077f", {"ar", "fa", "ur", "ps", "sd"}),
+    "Cyrillic": ("\u0400-\u04ff", {"ru", "uk", "be", "bg", "mk", "sr", "kk", "mn", "tg", "tt", "ba"}),
+    "Greek": ("\u0370-\u03ff", {"el"}),
+    "CJK": ("\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af", {"zh", "ja", "ko", "yue"}),
+    "Devanagari": ("\u0900-\u097f", {"hi", "mr", "ne", "sa"}),
+    "Armenian": ("\u0530-\u058f", {"hy"}),
+    "Georgian": ("\u10a0-\u10ff", {"ka"}),
+    "Thai": ("\u0e00-\u0e7f", {"th"}),
+}
+
+
+def script_mismatch(language: str | None, data: dict) -> str | None:
+    """Whisper sometimes answers a forced low-resource language (e.g. Yiddish)
+    with an English *translation*. Flag when the requested language is written
+    in a non-Latin script but the transcript came back mostly in Latin letters."""
+    if not language:
+        return None
+    script = next((name for name, (_, langs) in _SCRIPTS.items() if language in langs), None)
+    if not script:
+        return None
+    text = " ".join(s.get("text") or "" for s in data.get("segments") or [])
+    native = len(re.findall(f"[{_SCRIPTS[script][0]}]", text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    if latin >= 50 and latin > 3 * native:
+        return (f"output is mostly Latin script although {language!r} ({script} script) was requested — "
+                f"Whisper probably translated it into English; check the text and re-run if needed")
+    return None
+
+
 # ---------------------------------------------------------------- imports
 def parse_json_import(raw: bytes) -> dict:
     """Accept either our stored snapshot shape or a raw DGX result JSON."""
@@ -309,7 +341,8 @@ def register_upload(project_id: str, filename: str, raw: bytes, source: str = "f
     return db.create_material(
         project_id=project_id, name=os.path.basename(filename), media_path=path,
         media_type=info["media_type"], duration=info["duration"],
-        width=info["width"], height=info["height"], source=source, has_audio=info["has_audio"])
+        width=info["width"], height=info["height"], source=source, has_audio=info["has_audio"],
+        tpme={"originating_media_file": os.path.basename(filename)}, audio_rev=media.AUDIO_REV)
 
 
 def _register_one(project_id: str, path: str, source: str = "file") -> dict:
@@ -317,7 +350,8 @@ def _register_one(project_id: str, path: str, source: str = "file") -> dict:
     return db.create_material(
         project_id=project_id, name=os.path.basename(path), media_path=os.path.abspath(path),
         media_type=info["media_type"], duration=info["duration"],
-        width=info["width"], height=info["height"], source=source, has_audio=info["has_audio"])
+        width=info["width"], height=info["height"], source=source, has_audio=info["has_audio"],
+        tpme={"originating_media_file": os.path.basename(path)})
 
 
 def register_path(project_id: str, path: str) -> list[dict]:
@@ -435,6 +469,14 @@ def _download(r: dict, cache: Path) -> str:
     return str(dest)
 
 
+def _url_filename(url: str | None) -> str | None:
+    """Content-resource URL → its file name (``…/tape1.mp4?sig=…`` → ``tape1.mp4``)."""
+    from urllib.parse import unquote, urlparse
+    if not url:
+        return None
+    return unquote(urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]) or url
+
+
 def _mux(video_path: str, audio_path: str, cache: Path) -> str:
     """Combine a silent video with a separately-published audio track."""
     import subprocess
@@ -453,8 +495,13 @@ def _fetch_canvas(videos: list[dict], sounds: list[dict], cache: Path, note) -> 
     has sound when the manifest offers it anywhere on the canvas: try each video
     alternative (``Choice``) until one has audio, else mux in a Sound body."""
     out: list[tuple[str, dict]] = []
+
+    def done(path_info, url):
+        path_info[1]["origin_url"] = url
+        return path_info
+
     if videos:
-        path, info = None, None
+        path, info, url = None, None, None
         # Non-streaming renditions first — they're single files and fast to fetch.
         for r in sorted(videos, key=_is_stream):
             note(f"downloading {r['url'].rsplit('/', 1)[-1]}")
@@ -463,7 +510,7 @@ def _fetch_canvas(videos: list[dict], sounds: list[dict], cache: Path, note) -> 
             if path is None or (cinfo["has_audio"] and not info["has_audio"]):
                 if path:
                     Path(path).unlink(missing_ok=True)
-                path, info = cand, cinfo
+                path, info, url = cand, cinfo, r["url"]
             else:
                 Path(cand).unlink(missing_ok=True)
             if info["has_audio"]:
@@ -475,13 +522,13 @@ def _fetch_canvas(videos: list[dict], sounds: list[dict], cache: Path, note) -> 
             path = _mux(path, snd, cache)
             info = media.probe(path)
             used_sound = True
-        out.append(media.ensure_browser_audio(path, info))
+        out.append(done(media.ensure_browser_audio(path, info), url))
         if used_sound:
             return out
     # Audio-only canvas, or extra Sound bodies beside a video that has its own sound.
     for r in sounds:
         note(f"downloading {r['url'].rsplit('/', 1)[-1]}")
-        out.append(media.ensure_browser_audio(_download(r, cache)))
+        out.append(done(media.ensure_browser_audio(_download(r, cache)), r["url"]))
     return out
 
 
@@ -511,7 +558,8 @@ def register_iiif(project_id: str, manifest_url: str, progress=None) -> list[dic
                 project_id, name=label if k == 0 else f"{label} (audio {k})", media_path=path,
                 media_type=info["media_type"], duration=info["duration"], width=info["width"],
                 height=info["height"], source="iiif", source_url=manifest_url,
-                has_audio=info["has_audio"]))
+                has_audio=info["has_audio"], audio_rev=media.AUDIO_REV,
+                tpme={"originating_media_file": _url_filename(info.get("origin_url"))}))
     if progress:
         progress(len(canvases), len(canvases), "done")
     return created

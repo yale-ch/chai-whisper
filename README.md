@@ -48,7 +48,12 @@ after backend edits, refresh the browser for frontend edits.)
    and “Transcribe selected”**. Jobs run on the server and show in the
    **Background jobs** tray (bottom right, minimizable) on every page, so you can
    keep working; queued jobs can be cancelled. Language accepts ISO 639-1/-2 codes
-   (`en`, `eng`, `ger`/`deu`, `en-US`) or a name. Or **Import…** an existing
+   (`en`, `eng`, `ger`/`deu`, `en-US`) or a name. Model **auto** uses ivrit.ai's
+   fine-tunes for Yiddish ([`ivrit-ai/yi-whisper-large-v3-turbo-ct2`](https://huggingface.co/ivrit-ai/yi-whisper-large-v3-turbo-ct2))
+   and Hebrew ([`ivrit-ai/whisper-large-v3-turbo-ct2`](https://huggingface.co/ivrit-ai/whisper-large-v3-turbo-ct2)),
+   else `large-v3`; those models always run with their language forced (map in
+   `app/languages.py`). A warning flags non-Latin-script languages that come back
+   in Latin script (Whisper translating instead of transcribing). Or **Import…** an existing
    `.vtt`, `.srt`, `.txt` or `.json` (any encoding — UTF-8/16, Windows-1252).
    Plain text is checked for timestamps (`[00:01:23]`, `Speaker 1  0:03`,
    `Jane (1:23): …`); without them, timings are estimated across the media length.
@@ -65,9 +70,13 @@ after backend edits, refresh the browser for frontend edits.)
    download as **CSV**. Run folders get `report.txt/json/csv`.
 7. **Export** writes the chosen formats (vtt, txt, srt, json, csv) plus **TPME**
    provenance sidecars ([AI4LAM TPME 1.0](https://doi.org/10.5281/zenodo.21287085)):
-   `<file>.tpme.json` per transcript file (with its sha256) and
-   `<name>.tpme-history.json` (the version chain). Field choices live in
-   `app/tpme.py`; set the TPME `provider` in project defaults.
+   `<file>.tpme.json` per transcript file (with its sha256) and the version
+   chain — either `<name>.tpme-history.json` or embedded in each sidecar as
+   `version_history` (project setting). Per-recording fields (media title,
+   originating file, provider, conventions, media language(s), review level)
+   are set in the recording's **Recording metadata** panel; `human_agent` comes
+   from its editors, and sensitive-language scans are logged in `processing`
+   with the lexicons used. Field choices live in `app/tpme.py`.
 8. **Your edits** panel quantifies changes per version and cumulatively.
 
 ## Layout

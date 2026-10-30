@@ -182,8 +182,9 @@ label.field span { display: block; font-size: 12.5px; font-weight: 600; color: v
 
 /* per-segment tools */
 .seg-head { display: flex; align-items: center; gap: 8px; }
-.seg-tools { display: none; gap: 2px; margin-left: auto; }
-.seg:hover .seg-tools, .seg:focus-within .seg-tools { display: inline-flex; }
+/* Line tools are always shown (dimmed) — hover-only tools were easy to miss and unreachable on touch screens. */
+.seg-tools { display: inline-flex; gap: 2px; margin-left: auto; opacity: .45; transition: opacity .12s; }
+.seg:hover .seg-tools, .seg:focus-within .seg-tools, .seg.active .seg-tools { opacity: 1; }
 .st { background: #eef4fc; color: var(--yale-blue); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; font-size: 12px; cursor: pointer; }
 .st:hover { background: var(--yale-mid); color: #fff; }
 .st { white-space: nowrap; }
@@ -268,3 +269,11 @@ label.field span .hint { display: inline; }
 #jobsTray .tray-note { font-size: 11.5px; padding-top: 6px; }
 #jobsTray.min { width: auto; }
 .spinner.light { border-color: rgba(255,255,255,.35); border-top-color: #fff; }
+
+/* playback-audio note under the player, version badge, key/value line */
+.media-note { margin-top: 6px; font-size: 12.5px; }
+.media-note.warn { background: #fdf1ea; color: var(--yale-orange); border: 1px solid var(--yale-orange); border-radius: 8px; padding: 8px 10px; }
+.media-note.warn button { margin-left: 6px; }
+.build-info { margin-right: 14px; font-size: 11px; color: rgba(255,255,255,.6); white-space: nowrap; }
+.kv { font-size: 12px; margin: -4px 0 10px; }
+#tpmeCard label.field input[type=text], #tpmeCard select { width: 100%; box-sizing: border-box; }
