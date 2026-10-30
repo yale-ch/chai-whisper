@@ -15,7 +15,9 @@ venv/
 uv.lock
 
 # Runtime / generated
-data/            # SQLite workspace DB (projects, materials, versions)
+# Local workspace: SQLite DB, copied media, exports — each person has their own.
+# (Git has no trailing comments: a comment on this line would stop it matching.)
+data/
 uploads/
 outputs/
 vendor/
